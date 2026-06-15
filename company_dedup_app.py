@@ -7,7 +7,7 @@ from rapidfuzz import fuzz, process
 
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Company Deduplicator",
+    page_title="List Screener",
     page_icon="🏢",
     layout="wide",
 )
@@ -259,8 +259,8 @@ SUFFIXES = re.compile(
     re.IGNORECASE
 )
 
-RESULTS_SESSION_KEY = "dedup_results"
-MOVED_SESSION_KEY = "dedup_moved_duplicate_ids"
+RESULTS_SESSION_KEY = "screener_results"
+MOVED_SESSION_KEY = "screener_moved_match_ids"
 
 def clean_for_output(name: str) -> str:
     """Remove numbers and demo tags for the output file."""
@@ -303,15 +303,15 @@ def read_file(f, nrows=None):
         return pd.read_csv(f, sep=sep, nrows=nrows)
     return pd.read_excel(f, nrows=nrows)
 
-def find_duplicates(main_names, new_names, threshold):
+def find_matches(main_names, new_names, threshold):
     """
     For each name in new_names, check if a fuzzy match exists in main_names.
     Returns:
-      duplicates  – list of dicts with id, raw_name, matched_main_name, score
-      unique_new  – list of new_names with no match
+      matches    – list of dicts with id, raw_name, matched_main_name, score
+      unique_new – list of new_names with no match
     """
     norm_main = [normalize(n) for n in main_names]
-    duplicates, unique_new = [], []
+    matches, unique_new = [], []
 
     for idx, raw in enumerate(new_names):
         norm = normalize(raw)
@@ -320,7 +320,7 @@ def find_duplicates(main_names, new_names, threshold):
         result = process.extractOne(norm, norm_main, scorer=fuzz.token_sort_ratio)
         if result and result[1] >= threshold:
             matched_original = main_names[result[2]]
-            duplicates.append({
+            matches.append({
                 "id": idx,
                 "raw_name": raw,
                 "matched_main_name": matched_original,
@@ -329,7 +329,7 @@ def find_duplicates(main_names, new_names, threshold):
         else:
             unique_new.append(raw)
 
-    return duplicates, unique_new
+    return matches, unique_new
 
 
 def store_results(payload: dict) -> None:
@@ -348,31 +348,31 @@ def get_visible_results():
         return None
 
     moved_ids = set(st.session_state.get(MOVED_SESSION_KEY, []))
-    promoted = [item for item in payload["duplicates"] if item["id"] in moved_ids]
-    remaining_duplicates = [item for item in payload["duplicates"] if item["id"] not in moved_ids]
+    promoted = [item for item in payload["matches"] if item["id"] in moved_ids]
+    remaining_matches = [item for item in payload["matches"] if item["id"] not in moved_ids]
     unique_names = payload["unique_new"] + [item["raw_name"] for item in promoted]
 
     return {
         "signature": payload["signature"],
         "main_names": payload["main_names"],
         "new_names": payload["new_names"],
-        "duplicates": remaining_duplicates,
+        "matches": remaining_matches,
         "promoted": promoted,
         "unique_names": unique_names,
     }
 
 
-def promote_duplicate(duplicate_id: int) -> None:
+def promote_match(match_id: int) -> None:
     moved_ids = list(st.session_state.get(MOVED_SESSION_KEY, []))
-    if duplicate_id not in moved_ids:
-        moved_ids.append(duplicate_id)
+    if match_id not in moved_ids:
+        moved_ids.append(match_id)
         st.session_state[MOVED_SESSION_KEY] = moved_ids
 
 
-def demote_duplicate(duplicate_id: int) -> None:
+def demote_match(match_id: int) -> None:
     moved_ids = list(st.session_state.get(MOVED_SESSION_KEY, []))
-    if duplicate_id in moved_ids:
-        moved_ids.remove(duplicate_id)
+    if match_id in moved_ids:
+        moved_ids.remove(match_id)
         st.session_state[MOVED_SESSION_KEY] = moved_ids
 
 
@@ -386,7 +386,7 @@ def build_unique_dataframe(unique_names):
 st.markdown("""
 <div class="hero">
   <div class="hero-eyebrow">&#9632; Exclusion List Automation</div>
-  <h1>List <span>Deduplicator</span></h1>
+  <h1>List <span>Screener</span></h1>
   <p>Upload your main database and a new list — get back only the rows that don't already exist, with fuzzy matching to catch name variations.</p>
 </div>
 """, unsafe_allow_html=True)
@@ -450,10 +450,10 @@ with thresh_col:
 with hint_col:
     st.markdown(f"<div style='font-family:JetBrains Mono,monospace;font-size:1.4rem;font-weight:700;color:#00ff88;text-align:center;padding-top:0.3rem'>{threshold}<span style='font-size:0.7rem;color:#3a4a5e;margin-left:2px'>/ 100</span></div>", unsafe_allow_html=True)
 
-st.markdown(f"<small style='color:#2a3a4e'>Scores &ge; {threshold} are flagged as duplicates &nbsp;&mdash;&nbsp; lower threshold catches more variations like <em>Acme Corp</em> vs <em>Acme Corporation</em></small>", unsafe_allow_html=True)
+st.markdown(f"<small style='color:#2a3a4e'>Scores &ge; {threshold} are flagged as matches &nbsp;&mdash;&nbsp; lower threshold catches more variations like <em>Acme Corp</em> vs <em>Acme Corporation</em></small>", unsafe_allow_html=True)
 st.markdown("")
 
-run = st.button("&#9889;  Run Deduplication", type="primary", use_container_width=True)
+run = st.button("&#9889;  Run Screening", type="primary", use_container_width=True)
 
 # ── Processing ────────────────────────────────────────────────────────────────
 if run:
@@ -472,8 +472,8 @@ if run:
         main_names = df_main[main_col].dropna().astype(str).tolist()
         new_names  = df_new[new_col].dropna().astype(str).tolist()
 
-        with st.spinner("Fuzzy matching…"):
-            duplicates, unique_new = find_duplicates(main_names, new_names, threshold)
+        with st.spinner("Screening…"):
+            matches, unique_new = find_matches(main_names, new_names, threshold)
 
         store_results({
             "signature": {
@@ -485,7 +485,7 @@ if run:
             },
             "main_names": main_names,
             "new_names": new_names,
-            "duplicates": duplicates,
+            "matches": matches,
             "unique_new": unique_new,
         })
 
@@ -496,7 +496,7 @@ if run:
 visible_results = get_visible_results()
 
 if visible_results:
-    remaining_duplicates = visible_results["duplicates"]
+    remaining_matches = visible_results["matches"]
     promoted = visible_results["promoted"]
     unique_names = visible_results["unique_names"]
 
@@ -509,27 +509,27 @@ if visible_results:
     with s2:
         st.markdown(f'<div class="stat-box"><div class="stat-num">{len(visible_results["new_names"]):,}</div><div class="stat-label">Checked</div></div>', unsafe_allow_html=True)
     with s3:
-        st.markdown(f'<div class="stat-box"><div class="stat-num warn">{len(remaining_duplicates):,}</div><div class="stat-label">Duplicates</div></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="stat-box"><div class="stat-num warn">{len(remaining_matches):,}</div><div class="stat-label">Matches</div></div>', unsafe_allow_html=True)
     with s4:
         st.markdown(f'<div class="stat-box"><div class="stat-num">{len(unique_names):,}</div><div class="stat-label">New &amp; Unique</div></div>', unsafe_allow_html=True)
 
     st.markdown("")
 
     if promoted:
-        st.markdown(f"<small style='color:#777'>Manually promoted from duplicates: {len(promoted)}</small>", unsafe_allow_html=True)
+        st.markdown(f"<small style='color:#777'>Manually promoted from matches: {len(promoted)}</small>", unsafe_allow_html=True)
         st.markdown("")
 
-    # ── Columns: unique | duplicates ───────────────────────────────────────
+    # ── Columns: unique | matches ───────────────────────────────────────────
     left, right = st.columns([1.2, 1])
 
     with left:
-        st.markdown('<div class="section-header">&#10003;&nbsp; Not duplicated &mdash; ready to add</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-header">&#10003;&nbsp; Not matched &mdash; ready to add</div>', unsafe_allow_html=True)
         if unique_names:
             df_out = build_unique_dataframe(unique_names)
             st.dataframe(df_out, use_container_width=True, hide_index=True)
 
             if promoted:
-                st.markdown('<div class="section-header" style="margin-top:1.2rem">&#8626;&nbsp; Manually promoted from duplicates</div>', unsafe_allow_html=True)
+                st.markdown('<div class="section-header" style="margin-top:1.2rem">&#8626;&nbsp; Manually promoted from matches</div>', unsafe_allow_html=True)
                 for item in sorted(promoted, key=lambda row: -row["score"]):
                     p_left, p_right = st.columns([0.82, 0.18])
                     score_class = "high" if item["score"] >= 90 else ""
@@ -540,8 +540,8 @@ if visible_results:
                           <span class="match-score {score_class}">{item["score"]}%</span>
                         </div>""", unsafe_allow_html=True)
                     with p_right:
-                        if st.button("Return", key=f"return_duplicate_{item['id']}", type="secondary"):
-                            demote_duplicate(item["id"])
+                        if st.button("Return", key=f"return_match_{item['id']}", type="secondary"):
+                            demote_match(item["id"])
                             st.rerun()
 
             st.markdown("")
@@ -570,29 +570,29 @@ if visible_results:
             st.info("All companies in the new file already exist in the main list.")
 
     with right:
-        st.markdown('<div class="section-header">&#8635;&nbsp; Matched as duplicates</div>', unsafe_allow_html=True)
-        if remaining_duplicates:
-            for duplicate in sorted(remaining_duplicates, key=lambda item: -item["score"]):
+        st.markdown('<div class="section-header">&#8635;&nbsp; Already in main list</div>', unsafe_allow_html=True)
+        if remaining_matches:
+            for match in sorted(remaining_matches, key=lambda item: -item["score"]):
                 row_left, row_right = st.columns([0.82, 0.18])
-                score_class = "high" if duplicate["score"] >= 90 else ""
+                score_class = "high" if match["score"] >= 90 else ""
                 with row_left:
                     st.markdown(f"""
                     <div class="match-card">
-                      <span class="match-names"><span class="match-main">{duplicate["raw_name"]}</span><span class="match-arrow"> &rarr; </span>{duplicate["matched_main_name"]}</span>
-                      <span class="match-score {score_class}">{duplicate["score"]}%</span>
+                      <span class="match-names"><span class="match-main">{match["raw_name"]}</span><span class="match-arrow"> &rarr; </span>{match["matched_main_name"]}</span>
+                      <span class="match-score {score_class}">{match["score"]}%</span>
                     </div>""", unsafe_allow_html=True)
                 with row_right:
-                    if st.button("Move", key=f"move_duplicate_{duplicate['id']}", type="secondary"):
-                        promote_duplicate(duplicate["id"])
+                    if st.button("Move", key=f"move_match_{match['id']}", type="secondary"):
+                        promote_match(match["id"])
                         st.rerun()
         else:
-            st.success("No duplicates found.")
+            st.success("No matches found.")
 
 else:
     st.markdown("""
     <div style='background:linear-gradient(135deg,#0d1117,#0c1520);border:1px dashed #1e2d3d;border-radius:10px;padding:2.5rem;text-align:center;margin-top:1rem'>
       <div style='font-family:JetBrains Mono,monospace;font-size:2rem;color:#1a2d3e;margin-bottom:0.8rem'>&#9632;</div>
-      <div style='color:#3a4a5e;font-size:0.9rem'>Upload both files and hit <strong style="color:#00ff8866">Run Deduplication</strong> to get started.</div>
+      <div style='color:#3a4a5e;font-size:0.9rem'>Upload both files and hit <strong style="color:#00ff8866">Run Screening</strong> to get started.</div>
       <div style='color:#1e2d3d;font-size:0.78rem;margin-top:0.5rem'>Supports .xlsx, .xls, and .csv</div>
     </div>
     """, unsafe_allow_html=True)
