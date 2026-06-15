@@ -507,10 +507,8 @@ visible_results = get_visible_results()
 
 if visible_results:
     remaining_matches = visible_results["matches"]
-    promoted          = visible_results["promoted"]
-    unique_indices    = visible_results["unique_indices"]
-    df_new_valid      = visible_results["df_new_valid"]
-    new_col           = visible_results["new_col"]
+    promoted = visible_results["promoted"]
+    unique_names = visible_results["unique_names"]
 
     # ── Stats ──────────────────────────────────────────────────────────────
     st.markdown('<div class="section-header">&#9632;&nbsp; Results</div>', unsafe_allow_html=True)
@@ -523,7 +521,7 @@ if visible_results:
     with s3:
         st.markdown(f'<div class="stat-box"><div class="stat-num warn">{len(remaining_matches):,}</div><div class="stat-label">Matches</div></div>', unsafe_allow_html=True)
     with s4:
-        st.markdown(f'<div class="stat-box"><div class="stat-num">{len(unique_indices):,}</div><div class="stat-label">New &amp; Unique</div></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="stat-box"><div class="stat-num">{len(unique_names):,}</div><div class="stat-label">New &amp; Unique</div></div>', unsafe_allow_html=True)
 
     st.markdown("")
 
@@ -536,11 +534,8 @@ if visible_results:
 
     with left:
         st.markdown('<div class="section-header">&#10003;&nbsp; Not matched &mdash; ready to add</div>', unsafe_allow_html=True)
-        if unique_indices:
-            cols = [c for c in (output_col_choices or [new_col]) if c in df_new_valid.columns] or [new_col]
-            df_out = df_new_valid.iloc[unique_indices][cols].copy().reset_index(drop=True)
-            df_out[new_col] = df_out[new_col].apply(clean_for_output)
-            df_out = df_out[df_out[new_col].str.strip() != ""].reset_index(drop=True)
+        if unique_names:
+            df_out = build_unique_dataframe(unique_names)
             st.dataframe(df_out, use_container_width=True, hide_index=True)
 
             if promoted:
