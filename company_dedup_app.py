@@ -643,75 +643,90 @@ with tab2:
                                          label_visibility="collapsed")
 
     with ap_col_b:
-        st.markdown('<div class="upload-label">&#9632;&nbsp; 02 &mdash; List to append</div>', unsafe_allow_html=True)
-        ap_new_file = st.file_uploader("List to append", type=["xlsx", "xls", "csv"], key="ap_new",
-                                        label_visibility="collapsed")
+        st.markdown('<div class="upload-label">&#9632;&nbsp; 02 &mdash; Files to append</div>', unsafe_allow_html=True)
+        ap_new_files = st.file_uploader("Files to append", type=["xlsx", "xls", "csv"], key="ap_new",
+                                         accept_multiple_files=True, label_visibility="collapsed")
 
     st.markdown("")
 
-    # ── Column mapping ──────────────────────────────────────────────────────────
-    ap_mapping = {}
+    # ── Per-file column mapping ─────────────────────────────────────────────────
+    ap_mappings = {}   # {filename: {main_col: source_col | APPEND_SKIP}}
 
-    if ap_main_file and ap_new_file:
+    if ap_main_file and ap_new_files:
         try:
             ap_main_cols = read_file(ap_main_file, nrows=0).columns.tolist()
-            ap_new_cols  = read_file(ap_new_file,  nrows=0).columns.tolist()
             ap_main_file.seek(0)
-            ap_new_file.seek(0)
-
-            st.markdown('<div class="section-header">&#9632;&nbsp; 03 &mdash; Column mapping</div>', unsafe_allow_html=True)
-            st.markdown("<small style='color:#3a4a5e'>For each column in the main list, choose the matching column from the file to append.</small>", unsafe_allow_html=True)
-            st.markdown("")
-
-            MAP_OPTIONS = [APPEND_SKIP] + ap_new_cols
-
-            hdr_l, hdr_r = st.columns([1, 2])
-            with hdr_l:
-                st.markdown("<small style='color:#2a3a4e;font-family:JetBrains Mono,monospace;text-transform:uppercase;letter-spacing:0.1em'>Main list column</small>", unsafe_allow_html=True)
-            with hdr_r:
-                st.markdown("<small style='color:#2a3a4e;font-family:JetBrains Mono,monospace;text-transform:uppercase;letter-spacing:0.1em'>Column from appended file</small>", unsafe_allow_html=True)
-
-            for mc in ap_main_cols:
-                auto_match = next((c for c in ap_new_cols if c.lower() == mc.lower()), None)
-                default_idx = ap_new_cols.index(auto_match) + 1 if auto_match else 0
-                map_l, map_r = st.columns([1, 2])
-                with map_l:
-                    st.markdown(f"<div style='padding:0.45rem 0;font-family:JetBrains Mono,monospace;font-size:0.8rem;color:#c9d1e0'>{mc}</div>", unsafe_allow_html=True)
-                with map_r:
-                    ap_mapping[mc] = st.selectbox(
-                        mc,
-                        MAP_OPTIONS,
-                        index=default_idx,
-                        key=f"ap_map_{mc}",
-                        label_visibility="collapsed",
-                    )
-
-            st.markdown("")
         except Exception:
-            pass
+            ap_main_cols = []
+
+        if ap_main_cols:
+            st.markdown('<div class="section-header">&#9632;&nbsp; 03 &mdash; Column mapping</div>', unsafe_allow_html=True)
+            st.markdown("<small style='color:#3a4a5e'>Each file gets its own mapping. For every column in the main list, pick the matching column from that file — or skip it.</small>", unsafe_allow_html=True)
+            st.markdown("")
+
+            for ap_file in ap_new_files:
+                with st.expander(f"**{ap_file.name}**", expanded=True):
+                    try:
+                        ap_new_cols = read_file(ap_file, nrows=0).columns.tolist()
+                        ap_file.seek(0)
+                    except Exception:
+                        st.warning(f"Could not read columns from {ap_file.name}.")
+                        continue
+
+                    MAP_OPTIONS = [APPEND_SKIP] + ap_new_cols
+                    file_mapping = {}
+
+                    hdr_l, hdr_r = st.columns([1, 2])
+                    with hdr_l:
+                        st.markdown("<small style='color:#2a3a4e;font-family:JetBrains Mono,monospace;text-transform:uppercase;letter-spacing:0.1em'>Main list column</small>", unsafe_allow_html=True)
+                    with hdr_r:
+                        st.markdown("<small style='color:#2a3a4e;font-family:JetBrains Mono,monospace;text-transform:uppercase;letter-spacing:0.1em'>Column from this file</small>", unsafe_allow_html=True)
+
+                    for mc in ap_main_cols:
+                        auto_match = next((c for c in ap_new_cols if c.lower() == mc.lower()), None)
+                        default_idx = ap_new_cols.index(auto_match) + 1 if auto_match else 0
+                        map_l, map_r = st.columns([1, 2])
+                        with map_l:
+                            st.markdown(f"<div style='padding:0.45rem 0;font-family:JetBrains Mono,monospace;font-size:0.8rem;color:#c9d1e0'>{mc}</div>", unsafe_allow_html=True)
+                        with map_r:
+                            file_mapping[mc] = st.selectbox(
+                                mc,
+                                MAP_OPTIONS,
+                                index=default_idx,
+                                key=f"ap_map_{ap_file.name}_{mc}",
+                                label_visibility="collapsed",
+                            )
+
+                    ap_mappings[ap_file.name] = file_mapping
 
     ap_run = st.button("&#9889;  Append Lists", type="primary", use_container_width=True)
 
     if ap_run:
-        if not ap_main_file or not ap_new_file:
-            st.error("Please upload both files before running.")
-        elif not ap_mapping:
+        if not ap_main_file or not ap_new_files:
+            st.error("Please upload the main list and at least one file to append.")
+        elif not ap_mappings:
             st.error("Column mapping could not be determined. Check your files.")
         else:
             try:
                 with st.spinner("Reading files…"):
-                    df_ap_main = read_file(ap_main_file)
-                    df_ap_new  = read_file(ap_new_file)
+                    df_result = read_file(ap_main_file)
 
-                with st.spinner("Merging…"):
-                    df_result = append_lists(df_ap_main, df_ap_new, ap_mapping)
+                total_appended = 0
+                for ap_file in ap_new_files:
+                    if ap_file.name not in ap_mappings:
+                        continue
+                    with st.spinner(f"Merging {ap_file.name}…"):
+                        df_ap_new = read_file(ap_file)
+                        rows_before = len(df_result)
+                        df_result = append_lists(df_result, df_ap_new, ap_mappings[ap_file.name])
+                        total_appended += len(df_result) - rows_before
 
                 st.markdown('<div class="section-header">&#9632;&nbsp; Result</div>', unsafe_allow_html=True)
                 ap_s1, ap_s2, ap_s3 = st.columns(3, gap="small")
                 with ap_s1:
-                    st.markdown(f'<div class="stat-box"><div class="stat-num">{len(df_ap_main):,}</div><div class="stat-label">Main rows</div></div>', unsafe_allow_html=True)
+                    st.markdown(f'<div class="stat-box"><div class="stat-num">{len(df_result) - total_appended:,}</div><div class="stat-label">Main rows</div></div>', unsafe_allow_html=True)
                 with ap_s2:
-                    st.markdown(f'<div class="stat-box"><div class="stat-num">{len(df_ap_new):,}</div><div class="stat-label">Appended rows</div></div>', unsafe_allow_html=True)
+                    st.markdown(f'<div class="stat-box"><div class="stat-num">{total_appended:,}</div><div class="stat-label">Appended rows</div></div>', unsafe_allow_html=True)
                 with ap_s3:
                     st.markdown(f'<div class="stat-box"><div class="stat-num">{len(df_result):,}</div><div class="stat-label">Total rows</div></div>', unsafe_allow_html=True)
 
@@ -747,11 +762,11 @@ with tab2:
                 st.error(f"Something went wrong: {e}")
                 st.exception(e)
 
-    elif not (ap_main_file and ap_new_file):
+    elif not (ap_main_file and ap_new_files):
         st.markdown("""
         <div style='background:linear-gradient(135deg,#0d1117,#0c1520);border:1px dashed #1e2d3d;border-radius:10px;padding:2.5rem;text-align:center;margin-top:1rem'>
           <div style='font-family:JetBrains Mono,monospace;font-size:2rem;color:#1a2d3e;margin-bottom:0.8rem'>&#9632;</div>
-          <div style='color:#3a4a5e;font-size:0.9rem'>Upload both files to configure column mapping, then hit <strong style="color:#00ff8866">Append Lists</strong>.</div>
+          <div style='color:#3a4a5e;font-size:0.9rem'>Upload your main list and one or more files to append, then hit <strong style="color:#00ff8866">Append Lists</strong>.</div>
           <div style='color:#1e2d3d;font-size:0.78rem;margin-top:0.5rem'>Supports .xlsx, .xls, and .csv</div>
         </div>
         """, unsafe_allow_html=True)
