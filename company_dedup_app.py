@@ -384,18 +384,16 @@ def demote_match(match_id: int) -> None:
         st.session_state[MOVED_SESSION_KEY] = moved_ids
 
 
-APPEND_NEW  = "— Add as new column —"
-APPEND_SKIP = "— Skip —"
+APPEND_SKIP = "— Skip / leave empty —"
 
 def append_lists(df_main, df_new, mapping):
+    # mapping: {main_col: source_col_in_df_new | APPEND_SKIP}
     new_rows = {}
-    for new_col, action in mapping.items():
-        if action == APPEND_SKIP:
-            continue
-        elif action == APPEND_NEW:
-            new_rows[new_col] = df_new[new_col].values
+    for main_col, source in mapping.items():
+        if source == APPEND_SKIP:
+            new_rows[main_col] = [None] * len(df_new)
         else:
-            new_rows[action] = df_new[new_col].values
+            new_rows[main_col] = df_new[source].values
     return pd.concat([df_main, pd.DataFrame(new_rows)], ignore_index=True)
 
 
@@ -662,29 +660,29 @@ with tab2:
             ap_new_file.seek(0)
 
             st.markdown('<div class="section-header">&#9632;&nbsp; 03 &mdash; Column mapping</div>', unsafe_allow_html=True)
-            st.markdown("<small style='color:#3a4a5e'>For each column in the file to append, choose the matching column in the main list — or add it as a new column.</small>", unsafe_allow_html=True)
+            st.markdown("<small style='color:#3a4a5e'>For each column in the main list, choose the matching column from the file to append.</small>", unsafe_allow_html=True)
             st.markdown("")
 
-            MAP_OPTIONS = [APPEND_NEW, APPEND_SKIP] + ap_main_cols
+            MAP_OPTIONS = [APPEND_SKIP] + ap_new_cols
 
             hdr_l, hdr_r = st.columns([1, 2])
             with hdr_l:
-                st.markdown("<small style='color:#2a3a4e;font-family:JetBrains Mono,monospace;text-transform:uppercase;letter-spacing:0.1em'>Column in appended file</small>", unsafe_allow_html=True)
+                st.markdown("<small style='color:#2a3a4e;font-family:JetBrains Mono,monospace;text-transform:uppercase;letter-spacing:0.1em'>Main list column</small>", unsafe_allow_html=True)
             with hdr_r:
-                st.markdown("<small style='color:#2a3a4e;font-family:JetBrains Mono,monospace;text-transform:uppercase;letter-spacing:0.1em'>Maps to (in main list)</small>", unsafe_allow_html=True)
+                st.markdown("<small style='color:#2a3a4e;font-family:JetBrains Mono,monospace;text-transform:uppercase;letter-spacing:0.1em'>Column from appended file</small>", unsafe_allow_html=True)
 
-            for nc in ap_new_cols:
-                auto_match = next((c for c in ap_main_cols if c.lower() == nc.lower()), None)
-                default_idx = ap_main_cols.index(auto_match) + 2 if auto_match else 0
+            for mc in ap_main_cols:
+                auto_match = next((c for c in ap_new_cols if c.lower() == mc.lower()), None)
+                default_idx = ap_new_cols.index(auto_match) + 1 if auto_match else 0
                 map_l, map_r = st.columns([1, 2])
                 with map_l:
-                    st.markdown(f"<div style='padding:0.45rem 0;font-family:JetBrains Mono,monospace;font-size:0.8rem;color:#c9d1e0'>{nc}</div>", unsafe_allow_html=True)
+                    st.markdown(f"<div style='padding:0.45rem 0;font-family:JetBrains Mono,monospace;font-size:0.8rem;color:#c9d1e0'>{mc}</div>", unsafe_allow_html=True)
                 with map_r:
-                    ap_mapping[nc] = st.selectbox(
-                        nc,
+                    ap_mapping[mc] = st.selectbox(
+                        mc,
                         MAP_OPTIONS,
                         index=default_idx,
-                        key=f"ap_map_{nc}",
+                        key=f"ap_map_{mc}",
                         label_visibility="collapsed",
                     )
 
