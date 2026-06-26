@@ -300,7 +300,13 @@ def read_file(f, nrows=None):
             sep = csv.Sniffer().sniff(sample, delimiters=',;').delimiter
         except csv.Error:
             sep = ','
-        return pd.read_csv(f, sep=sep, nrows=nrows)
+        for encoding in ('utf-8', 'cp1252', 'latin-1'):
+            try:
+                df = pd.read_csv(f, sep=sep, nrows=nrows, encoding=encoding)
+                return df
+            except UnicodeDecodeError:
+                f.seek(0)
+        return pd.read_csv(f, sep=sep, nrows=nrows, encoding='latin-1', encoding_errors='replace')
     return pd.read_excel(f, nrows=nrows)
 
 def find_matches(main_names, new_names, threshold):
@@ -378,239 +384,379 @@ def demote_match(match_id: int) -> None:
         st.session_state[MOVED_SESSION_KEY] = moved_ids
 
 
+APPEND_NEW  = "— Add as new column —"
+APPEND_SKIP = "— Skip —"
+
+def append_lists(df_main, df_new, mapping):
+    new_rows = {}
+    for new_col, action in mapping.items():
+        if action == APPEND_SKIP:
+            continue
+        elif action == APPEND_NEW:
+            new_rows[new_col] = df_new[new_col].values
+        else:
+            new_rows[action] = df_new[new_col].values
+    return pd.concat([df_main, pd.DataFrame(new_rows)], ignore_index=True)
+
 
 # ── UI ────────────────────────────────────────────────────────────────────────
 
 st.markdown("""
 <div class="hero">
   <div class="hero-eyebrow">&#9632; Exclusion List Automation</div>
-  <h1>List <span>Screener</span></h1>
-  <p>Upload your main database and a new list — get back only the rows that don't already exist, with fuzzy matching to catch name variations.</p>
+  <h1>List <span>Tools</span></h1>
+  <p>Screen new entries against your database, or append and merge two lists with custom column mapping.</p>
 </div>
 """, unsafe_allow_html=True)
 
-# ── Upload ─────────────────────────────────────────────────────────────────────
-col_a, col_b = st.columns(2, gap="medium")
+tab1, tab2 = st.tabs(["List Screener", "List Appender"])
 
-with col_a:
-    st.markdown('<div class="upload-label">&#9632;&nbsp; 01 &mdash; Main database</div>', unsafe_allow_html=True)
-    main_file = st.file_uploader("Main database", type=["xlsx", "xls", "csv"], key="main",
-                                  label_visibility="collapsed")
+# ── Tab 1: List Screener ───────────────────────────────────────────────────────
+with tab1:
 
-with col_b:
-    st.markdown('<div class="upload-label">&#9632;&nbsp; 02 &mdash; New companies</div>', unsafe_allow_html=True)
-    new_file  = st.file_uploader("New companies to check", type=["xlsx", "xls", "csv"], key="new",
-                                  label_visibility="collapsed")
+    # ── Upload ─────────────────────────────────────────────────────────────────
+    col_a, col_b = st.columns(2, gap="medium")
 
-st.markdown("")
+    with col_a:
+        st.markdown('<div class="upload-label">&#9632;&nbsp; 01 &mdash; Main database</div>', unsafe_allow_html=True)
+        main_file = st.file_uploader("Main database", type=["xlsx", "xls", "csv"], key="main",
+                                      label_visibility="collapsed")
 
-# ── Column selection ───────────────────────────────────────────────────────────
-main_col_choice    = None
-new_col_choice     = None
-output_col_choices = None
-
-if main_file and new_file:
-    try:
-        main_cols = read_file(main_file, nrows=0).columns.tolist()
-        new_cols  = read_file(new_file,  nrows=0).columns.tolist()
-        main_file.seek(0)
-        new_file.seek(0)
-
-        st.markdown('<div class="section-header">&#9632;&nbsp; 03 &mdash; Column to compare</div>', unsafe_allow_html=True)
-        col_sel_a, col_sel_b = st.columns(2, gap="medium")
-        with col_sel_a:
-            default_main = detect_company_col(main_cols)
-            main_col_choice = st.selectbox(
-                "Main database — company column",
-                main_cols,
-                index=main_cols.index(default_main),
-            )
-        with col_sel_b:
-            default_new = detect_company_col(new_cols)
-            new_col_choice = st.selectbox(
-                "New list — company column",
-                new_cols,
-                index=new_cols.index(default_new),
-            )
-
-        st.markdown("")
-        st.markdown('<div class="section-header">&#9632;&nbsp; 04 &mdash; Output columns</div>', unsafe_allow_html=True)
-        output_col_choices = st.multiselect(
-            "Columns from the new list to include in the output",
-            new_cols,
-            default=[new_col_choice],
-        )
-        st.markdown("")
-    except Exception:
-        pass  # if preview read fails, fall back to auto-detect at run time
-
-st.markdown('<div class="section-header">&#9632;&nbsp; 05 &mdash; Match sensitivity</div>', unsafe_allow_html=True)
-
-thresh_col, hint_col = st.columns([3, 1])
-with thresh_col:
-    threshold = st.slider(
-        "Match threshold",
-        min_value=50, max_value=100, value=70,
-        help="Lower = catches more variations. 70 is a good default.",
-        label_visibility="collapsed"
-    )
-with hint_col:
-    st.markdown(f"<div style='font-family:JetBrains Mono,monospace;font-size:1.4rem;font-weight:700;color:#00ff88;text-align:center;padding-top:0.3rem'>{threshold}<span style='font-size:0.7rem;color:#3a4a5e;margin-left:2px'>/ 100</span></div>", unsafe_allow_html=True)
-
-st.markdown(f"<small style='color:#2a3a4e'>Scores &ge; {threshold} are flagged as matches &nbsp;&mdash;&nbsp; lower threshold catches more variations like <em>Acme Corp</em> vs <em>Acme Corporation</em></small>", unsafe_allow_html=True)
-st.markdown("")
-
-run = st.button("&#9889;  Run Screening", type="primary", use_container_width=True)
-
-# ── Processing ────────────────────────────────────────────────────────────────
-if run:
-    if not main_file or not new_file:
-        st.error("Please upload both files before running.")
-        st.stop()
-
-    try:
-        with st.spinner("Reading files…"):
-            df_main = read_file(main_file)
-            df_new  = read_file(new_file)
-
-        main_col = main_col_choice or detect_company_col(df_main.columns.tolist())
-        new_col  = new_col_choice  or detect_company_col(df_new.columns.tolist())
-
-        main_names  = df_main[main_col].dropna().astype(str).tolist()
-        df_new_valid = df_new.dropna(subset=[new_col]).reset_index(drop=True)
-        new_names   = df_new_valid[new_col].astype(str).tolist()
-
-        with st.spinner("Screening…"):
-            matches, unique_new = find_matches(main_names, new_names, threshold)
-
-        store_results({
-            "signature": {
-                "main_file": getattr(main_file, "name", ""),
-                "main_size": getattr(main_file, "size", None),
-                "new_file": getattr(new_file, "name", ""),
-                "new_size": getattr(new_file, "size", None),
-                "threshold": threshold,
-            },
-            "main_names": main_names,
-            "new_names": new_names,
-            "matches": matches,
-            "unique_new": unique_new,
-            "df_new_valid": df_new_valid,
-            "new_col": new_col,
-        })
-
-    except Exception as e:
-        st.error(f"Something went wrong: {e}")
-        st.exception(e)
-
-visible_results = get_visible_results()
-
-if visible_results:
-    remaining_matches = visible_results["matches"]
-    promoted          = visible_results["promoted"]
-    unique_indices    = visible_results["unique_indices"]
-    df_new_valid      = visible_results["df_new_valid"]
-    new_col           = visible_results["new_col"]
-
-    # ── Stats ──────────────────────────────────────────────────────────────
-    st.markdown('<div class="section-header">&#9632;&nbsp; Results</div>', unsafe_allow_html=True)
-
-    s1, s2, s3, s4 = st.columns(4, gap="small")
-    with s1:
-        st.markdown(f'<div class="stat-box"><div class="stat-num">{len(visible_results["main_names"]):,}</div><div class="stat-label">Main DB</div></div>', unsafe_allow_html=True)
-    with s2:
-        st.markdown(f'<div class="stat-box"><div class="stat-num">{len(visible_results["new_names"]):,}</div><div class="stat-label">Checked</div></div>', unsafe_allow_html=True)
-    with s3:
-        st.markdown(f'<div class="stat-box"><div class="stat-num warn">{len(remaining_matches):,}</div><div class="stat-label">Matches</div></div>', unsafe_allow_html=True)
-    with s4:
-        st.markdown(f'<div class="stat-box"><div class="stat-num">{len(unique_indices):,}</div><div class="stat-label">New &amp; Unique</div></div>', unsafe_allow_html=True)
+    with col_b:
+        st.markdown('<div class="upload-label">&#9632;&nbsp; 02 &mdash; New companies</div>', unsafe_allow_html=True)
+        new_file  = st.file_uploader("New companies to check", type=["xlsx", "xls", "csv"], key="new",
+                                      label_visibility="collapsed")
 
     st.markdown("")
 
-    if promoted:
-        st.markdown(f"<small style='color:#777'>Manually promoted from matches: {len(promoted)}</small>", unsafe_allow_html=True)
-        st.markdown("")
+    # ── Column selection ────────────────────────────────────────────────────────
+    main_col_choice    = None
+    new_col_choice     = None
+    output_col_choices = None
 
-    # ── Columns: unique | matches ───────────────────────────────────────────
-    left, right = st.columns([1.2, 1])
+    if main_file and new_file:
+        try:
+            main_cols = read_file(main_file, nrows=0).columns.tolist()
+            new_cols  = read_file(new_file,  nrows=0).columns.tolist()
+            main_file.seek(0)
+            new_file.seek(0)
 
-    with left:
-        st.markdown('<div class="section-header">&#10003;&nbsp; Not matched &mdash; ready to add</div>', unsafe_allow_html=True)
-        if unique_indices:
-            cols = [c for c in (output_col_choices or [new_col]) if c in df_new_valid.columns] or [new_col]
-            df_out = df_new_valid.iloc[unique_indices][cols].copy().reset_index(drop=True)
-            df_out[new_col] = df_out[new_col].apply(clean_for_output)
-            df_out = df_out[df_out[new_col].str.strip() != ""].reset_index(drop=True)
-            st.dataframe(df_out, use_container_width=True, hide_index=True)
-
-            if promoted:
-                st.markdown('<div class="section-header" style="margin-top:1.2rem">&#8626;&nbsp; Manually promoted from matches</div>', unsafe_allow_html=True)
-                for item in sorted(promoted, key=lambda row: -row["score"]):
-                    p_left, p_right = st.columns([0.82, 0.18])
-                    score_class = "high" if item["score"] >= 90 else ""
-                    with p_left:
-                        st.markdown(f"""
-                        <div class="match-card">
-                          <span class="match-names"><span class="match-main">{item["raw_name"]}</span><span class="match-arrow"> matched </span>{item["matched_main_name"]}</span>
-                          <span class="match-score {score_class}">{item["score"]}%</span>
-                        </div>""", unsafe_allow_html=True)
-                    with p_right:
-                        if st.button("Return", key=f"return_match_{item['id']}", type="secondary"):
-                            demote_match(item["id"])
-                            st.rerun()
+            st.markdown('<div class="section-header">&#9632;&nbsp; 03 &mdash; Column to compare</div>', unsafe_allow_html=True)
+            col_sel_a, col_sel_b = st.columns(2, gap="medium")
+            with col_sel_a:
+                default_main = detect_company_col(main_cols)
+                main_col_choice = st.selectbox(
+                    "Main database — company column",
+                    main_cols,
+                    index=main_cols.index(default_main),
+                )
+            with col_sel_b:
+                default_new = detect_company_col(new_cols)
+                new_col_choice = st.selectbox(
+                    "New list — company column",
+                    new_cols,
+                    index=new_cols.index(default_new),
+                )
 
             st.markdown("")
-            dl_a, dl_b = st.columns(2, gap="small")
-            csv_bytes = df_out.to_csv(index=False).encode("utf-8")
-            with dl_a:
-                st.download_button(
-                    label="&#11015;  Download CSV",
-                    data=csv_bytes,
-                    file_name="new_unique_companies.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                )
-            with dl_b:
-                excel_buf = io.BytesIO()
-                with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
-                    df_out.to_excel(writer, index=False, sheet_name="Unique Companies")
-                st.download_button(
-                    label="&#11015;  Download Excel",
-                    data=excel_buf.getvalue(),
-                    file_name="new_unique_companies.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
-                )
-        else:
-            st.info("All companies in the new file already exist in the main list.")
+            st.markdown('<div class="section-header">&#9632;&nbsp; 04 &mdash; Output columns</div>', unsafe_allow_html=True)
+            output_col_choices = st.multiselect(
+                "Columns from the new list to include in the output",
+                new_cols,
+                default=[new_col_choice],
+            )
+            st.markdown("")
+        except Exception:
+            pass
 
-    with right:
-        st.markdown('<div class="section-header">&#8635;&nbsp; Already in main list</div>', unsafe_allow_html=True)
-        if remaining_matches:
-            for match in sorted(remaining_matches, key=lambda item: -item["score"]):
-                row_left, row_right = st.columns([0.82, 0.18])
-                score_class = "high" if match["score"] >= 90 else ""
-                with row_left:
-                    st.markdown(f"""
-                    <div class="match-card">
-                      <span class="match-names"><span class="match-main">{match["raw_name"]}</span><span class="match-arrow"> &rarr; </span>{match["matched_main_name"]}</span>
-                      <span class="match-score {score_class}">{match["score"]}%</span>
-                    </div>""", unsafe_allow_html=True)
-                with row_right:
-                    if st.button("Move", key=f"move_match_{match['id']}", type="secondary"):
-                        promote_match(match["id"])
-                        st.rerun()
-        else:
-            st.success("No matches found.")
+    st.markdown('<div class="section-header">&#9632;&nbsp; 05 &mdash; Match sensitivity</div>', unsafe_allow_html=True)
 
-else:
-    st.markdown("""
-    <div style='background:linear-gradient(135deg,#0d1117,#0c1520);border:1px dashed #1e2d3d;border-radius:10px;padding:2.5rem;text-align:center;margin-top:1rem'>
-      <div style='font-family:JetBrains Mono,monospace;font-size:2rem;color:#1a2d3e;margin-bottom:0.8rem'>&#9632;</div>
-      <div style='color:#3a4a5e;font-size:0.9rem'>Upload both files and hit <strong style="color:#00ff8866">Run Screening</strong> to get started.</div>
-      <div style='color:#1e2d3d;font-size:0.78rem;margin-top:0.5rem'>Supports .xlsx, .xls, and .csv</div>
-    </div>
-    """, unsafe_allow_html=True)
+    thresh_col, hint_col = st.columns([3, 1])
+    with thresh_col:
+        threshold = st.slider(
+            "Match threshold",
+            min_value=50, max_value=100, value=70,
+            help="Lower = catches more variations. 70 is a good default.",
+            label_visibility="collapsed"
+        )
+    with hint_col:
+        st.markdown(f"<div style='font-family:JetBrains Mono,monospace;font-size:1.4rem;font-weight:700;color:#00ff88;text-align:center;padding-top:0.3rem'>{threshold}<span style='font-size:0.7rem;color:#3a4a5e;margin-left:2px'>/ 100</span></div>", unsafe_allow_html=True)
+
+    st.markdown(f"<small style='color:#2a3a4e'>Scores &ge; {threshold} are flagged as matches &nbsp;&mdash;&nbsp; lower threshold catches more variations like <em>Acme Corp</em> vs <em>Acme Corporation</em></small>", unsafe_allow_html=True)
+    st.markdown("")
+
+    run = st.button("&#9889;  Run Screening", type="primary", use_container_width=True)
+
+    if run:
+        if not main_file or not new_file:
+            st.error("Please upload both files before running.")
+        else:
+            try:
+                with st.spinner("Reading files…"):
+                    df_main = read_file(main_file)
+                    df_new  = read_file(new_file)
+
+                main_col = main_col_choice or detect_company_col(df_main.columns.tolist())
+                new_col  = new_col_choice  or detect_company_col(df_new.columns.tolist())
+
+                main_names   = df_main[main_col].dropna().astype(str).tolist()
+                df_new_valid = df_new.dropna(subset=[new_col]).reset_index(drop=True)
+                new_names    = df_new_valid[new_col].astype(str).tolist()
+
+                with st.spinner("Screening…"):
+                    matches, unique_new = find_matches(main_names, new_names, threshold)
+
+                store_results({
+                    "signature": {
+                        "main_file": getattr(main_file, "name", ""),
+                        "main_size": getattr(main_file, "size", None),
+                        "new_file": getattr(new_file, "name", ""),
+                        "new_size": getattr(new_file, "size", None),
+                        "threshold": threshold,
+                    },
+                    "main_names": main_names,
+                    "new_names": new_names,
+                    "matches": matches,
+                    "unique_new": unique_new,
+                    "df_new_valid": df_new_valid,
+                    "new_col": new_col,
+                })
+
+            except Exception as e:
+                st.error(f"Something went wrong: {e}")
+                st.exception(e)
+
+    visible_results = get_visible_results()
+
+    if visible_results:
+        remaining_matches = visible_results["matches"]
+        promoted          = visible_results["promoted"]
+        unique_indices    = visible_results["unique_indices"]
+        df_new_valid      = visible_results["df_new_valid"]
+        new_col           = visible_results["new_col"]
+
+        st.markdown('<div class="section-header">&#9632;&nbsp; Results</div>', unsafe_allow_html=True)
+
+        s1, s2, s3, s4 = st.columns(4, gap="small")
+        with s1:
+            st.markdown(f'<div class="stat-box"><div class="stat-num">{len(visible_results["main_names"]):,}</div><div class="stat-label">Main DB</div></div>', unsafe_allow_html=True)
+        with s2:
+            st.markdown(f'<div class="stat-box"><div class="stat-num">{len(visible_results["new_names"]):,}</div><div class="stat-label">Checked</div></div>', unsafe_allow_html=True)
+        with s3:
+            st.markdown(f'<div class="stat-box"><div class="stat-num warn">{len(remaining_matches):,}</div><div class="stat-label">Matches</div></div>', unsafe_allow_html=True)
+        with s4:
+            st.markdown(f'<div class="stat-box"><div class="stat-num">{len(unique_indices):,}</div><div class="stat-label">New &amp; Unique</div></div>', unsafe_allow_html=True)
+
+        st.markdown("")
+
+        if promoted:
+            st.markdown(f"<small style='color:#777'>Manually promoted from matches: {len(promoted)}</small>", unsafe_allow_html=True)
+            st.markdown("")
+
+        left, right = st.columns([1.2, 1])
+
+        with left:
+            st.markdown('<div class="section-header">&#10003;&nbsp; Not matched &mdash; ready to add</div>', unsafe_allow_html=True)
+            if unique_indices:
+                cols = [c for c in (output_col_choices or [new_col]) if c in df_new_valid.columns] or [new_col]
+                df_out = df_new_valid.iloc[unique_indices][cols].copy().reset_index(drop=True)
+                df_out[new_col] = df_out[new_col].apply(clean_for_output)
+                df_out = df_out[df_out[new_col].str.strip() != ""].reset_index(drop=True)
+                st.dataframe(df_out, use_container_width=True, hide_index=True)
+
+                if promoted:
+                    st.markdown('<div class="section-header" style="margin-top:1.2rem">&#8626;&nbsp; Manually promoted from matches</div>', unsafe_allow_html=True)
+                    for item in sorted(promoted, key=lambda row: -row["score"]):
+                        p_left, p_right = st.columns([0.82, 0.18])
+                        score_class = "high" if item["score"] >= 90 else ""
+                        with p_left:
+                            st.markdown(f"""
+                            <div class="match-card">
+                              <span class="match-names"><span class="match-main">{item["raw_name"]}</span><span class="match-arrow"> matched </span>{item["matched_main_name"]}</span>
+                              <span class="match-score {score_class}">{item["score"]}%</span>
+                            </div>""", unsafe_allow_html=True)
+                        with p_right:
+                            if st.button("Return", key=f"return_match_{item['id']}", type="secondary"):
+                                demote_match(item["id"])
+                                st.rerun()
+
+                st.markdown("")
+                dl_a, dl_b = st.columns(2, gap="small")
+                csv_bytes = df_out.to_csv(index=False).encode("utf-8")
+                with dl_a:
+                    st.download_button(
+                        label="&#11015;  Download CSV",
+                        data=csv_bytes,
+                        file_name="new_unique_companies.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                    )
+                with dl_b:
+                    excel_buf = io.BytesIO()
+                    with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
+                        df_out.to_excel(writer, index=False, sheet_name="Unique Companies")
+                    st.download_button(
+                        label="&#11015;  Download Excel",
+                        data=excel_buf.getvalue(),
+                        file_name="new_unique_companies.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                    )
+            else:
+                st.info("All companies in the new file already exist in the main list.")
+
+        with right:
+            st.markdown('<div class="section-header">&#8635;&nbsp; Already in main list</div>', unsafe_allow_html=True)
+            if remaining_matches:
+                for match in sorted(remaining_matches, key=lambda item: -item["score"]):
+                    row_left, row_right = st.columns([0.82, 0.18])
+                    score_class = "high" if match["score"] >= 90 else ""
+                    with row_left:
+                        st.markdown(f"""
+                        <div class="match-card">
+                          <span class="match-names"><span class="match-main">{match["raw_name"]}</span><span class="match-arrow"> &rarr; </span>{match["matched_main_name"]}</span>
+                          <span class="match-score {score_class}">{match["score"]}%</span>
+                        </div>""", unsafe_allow_html=True)
+                    with row_right:
+                        if st.button("Move", key=f"move_match_{match['id']}", type="secondary"):
+                            promote_match(match["id"])
+                            st.rerun()
+            else:
+                st.success("No matches found.")
+
+    else:
+        st.markdown("""
+        <div style='background:linear-gradient(135deg,#0d1117,#0c1520);border:1px dashed #1e2d3d;border-radius:10px;padding:2.5rem;text-align:center;margin-top:1rem'>
+          <div style='font-family:JetBrains Mono,monospace;font-size:2rem;color:#1a2d3e;margin-bottom:0.8rem'>&#9632;</div>
+          <div style='color:#3a4a5e;font-size:0.9rem'>Upload both files and hit <strong style="color:#00ff8866">Run Screening</strong> to get started.</div>
+          <div style='color:#1e2d3d;font-size:0.78rem;margin-top:0.5rem'>Supports .xlsx, .xls, and .csv</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+# ── Tab 2: List Appender ───────────────────────────────────────────────────────
+with tab2:
+
+    # ── Upload ─────────────────────────────────────────────────────────────────
+    ap_col_a, ap_col_b = st.columns(2, gap="medium")
+
+    with ap_col_a:
+        st.markdown('<div class="upload-label">&#9632;&nbsp; 01 &mdash; Main list</div>', unsafe_allow_html=True)
+        ap_main_file = st.file_uploader("Main list", type=["xlsx", "xls", "csv"], key="ap_main",
+                                         label_visibility="collapsed")
+
+    with ap_col_b:
+        st.markdown('<div class="upload-label">&#9632;&nbsp; 02 &mdash; List to append</div>', unsafe_allow_html=True)
+        ap_new_file = st.file_uploader("List to append", type=["xlsx", "xls", "csv"], key="ap_new",
+                                        label_visibility="collapsed")
+
+    st.markdown("")
+
+    # ── Column mapping ──────────────────────────────────────────────────────────
+    ap_mapping = {}
+
+    if ap_main_file and ap_new_file:
+        try:
+            ap_main_cols = read_file(ap_main_file, nrows=0).columns.tolist()
+            ap_new_cols  = read_file(ap_new_file,  nrows=0).columns.tolist()
+            ap_main_file.seek(0)
+            ap_new_file.seek(0)
+
+            st.markdown('<div class="section-header">&#9632;&nbsp; 03 &mdash; Column mapping</div>', unsafe_allow_html=True)
+            st.markdown("<small style='color:#3a4a5e'>For each column in the file to append, choose the matching column in the main list — or add it as a new column.</small>", unsafe_allow_html=True)
+            st.markdown("")
+
+            MAP_OPTIONS = [APPEND_NEW, APPEND_SKIP] + ap_main_cols
+
+            hdr_l, hdr_r = st.columns([1, 2])
+            with hdr_l:
+                st.markdown("<small style='color:#2a3a4e;font-family:JetBrains Mono,monospace;text-transform:uppercase;letter-spacing:0.1em'>Column in appended file</small>", unsafe_allow_html=True)
+            with hdr_r:
+                st.markdown("<small style='color:#2a3a4e;font-family:JetBrains Mono,monospace;text-transform:uppercase;letter-spacing:0.1em'>Maps to (in main list)</small>", unsafe_allow_html=True)
+
+            for nc in ap_new_cols:
+                auto_match = next((c for c in ap_main_cols if c.lower() == nc.lower()), None)
+                default_idx = ap_main_cols.index(auto_match) + 2 if auto_match else 0
+                map_l, map_r = st.columns([1, 2])
+                with map_l:
+                    st.markdown(f"<div style='padding:0.45rem 0;font-family:JetBrains Mono,monospace;font-size:0.8rem;color:#c9d1e0'>{nc}</div>", unsafe_allow_html=True)
+                with map_r:
+                    ap_mapping[nc] = st.selectbox(
+                        nc,
+                        MAP_OPTIONS,
+                        index=default_idx,
+                        key=f"ap_map_{nc}",
+                        label_visibility="collapsed",
+                    )
+
+            st.markdown("")
+        except Exception:
+            pass
+
+    ap_run = st.button("&#9889;  Append Lists", type="primary", use_container_width=True)
+
+    if ap_run:
+        if not ap_main_file or not ap_new_file:
+            st.error("Please upload both files before running.")
+        elif not ap_mapping:
+            st.error("Column mapping could not be determined. Check your files.")
+        else:
+            try:
+                with st.spinner("Reading files…"):
+                    df_ap_main = read_file(ap_main_file)
+                    df_ap_new  = read_file(ap_new_file)
+
+                with st.spinner("Merging…"):
+                    df_result = append_lists(df_ap_main, df_ap_new, ap_mapping)
+
+                st.markdown('<div class="section-header">&#9632;&nbsp; Result</div>', unsafe_allow_html=True)
+                ap_s1, ap_s2, ap_s3 = st.columns(3, gap="small")
+                with ap_s1:
+                    st.markdown(f'<div class="stat-box"><div class="stat-num">{len(df_ap_main):,}</div><div class="stat-label">Main rows</div></div>', unsafe_allow_html=True)
+                with ap_s2:
+                    st.markdown(f'<div class="stat-box"><div class="stat-num">{len(df_ap_new):,}</div><div class="stat-label">Appended rows</div></div>', unsafe_allow_html=True)
+                with ap_s3:
+                    st.markdown(f'<div class="stat-box"><div class="stat-num">{len(df_result):,}</div><div class="stat-label">Total rows</div></div>', unsafe_allow_html=True)
+
+                st.markdown("")
+                st.dataframe(df_result.head(200), use_container_width=True, hide_index=True)
+                if len(df_result) > 200:
+                    st.markdown(f"<small style='color:#3a4a5e'>Showing first 200 of {len(df_result):,} rows.</small>", unsafe_allow_html=True)
+
+                st.markdown("")
+                ap_dl_a, ap_dl_b = st.columns(2, gap="small")
+                ap_csv = df_result.to_csv(index=False).encode("utf-8")
+                with ap_dl_a:
+                    st.download_button(
+                        label="&#11015;  Download CSV",
+                        data=ap_csv,
+                        file_name="appended_list.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                    )
+                with ap_dl_b:
+                    ap_excel_buf = io.BytesIO()
+                    with pd.ExcelWriter(ap_excel_buf, engine="openpyxl") as writer:
+                        df_result.to_excel(writer, index=False, sheet_name="Appended List")
+                    st.download_button(
+                        label="&#11015;  Download Excel",
+                        data=ap_excel_buf.getvalue(),
+                        file_name="appended_list.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                    )
+
+            except Exception as e:
+                st.error(f"Something went wrong: {e}")
+                st.exception(e)
+
+    elif not (ap_main_file and ap_new_file):
+        st.markdown("""
+        <div style='background:linear-gradient(135deg,#0d1117,#0c1520);border:1px dashed #1e2d3d;border-radius:10px;padding:2.5rem;text-align:center;margin-top:1rem'>
+          <div style='font-family:JetBrains Mono,monospace;font-size:2rem;color:#1a2d3e;margin-bottom:0.8rem'>&#9632;</div>
+          <div style='color:#3a4a5e;font-size:0.9rem'>Upload both files to configure column mapping, then hit <strong style="color:#00ff8866">Append Lists</strong>.</div>
+          <div style='color:#1e2d3d;font-size:0.78rem;margin-top:0.5rem'>Supports .xlsx, .xls, and .csv</div>
+        </div>
+        """, unsafe_allow_html=True)
 
 # ── Footer ─────────────────────────────────────────────────────────────────────
 st.markdown("<br><hr style='border-color:#0d1520;margin-top:2rem'>", unsafe_allow_html=True)
