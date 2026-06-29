@@ -669,7 +669,8 @@ with tab2:
     st.markdown("")
 
     # ── Per-file column mapping ─────────────────────────────────────────────────
-    ap_mappings = {}   # {filename: {main_col: source_col | APPEND_SKIP}}
+    ap_mappings  = {}   # {filename: {main_col: source_col | APPEND_SKIP}}
+    ap_email_col = None
 
     if ap_main_file and ap_new_files:
         try:
@@ -718,6 +719,21 @@ with tab2:
 
                     ap_mappings[ap_file.name] = file_mapping
 
+            st.markdown("")
+            st.markdown('<div class="section-header">&#9632;&nbsp; 04 &mdash; Email duplicate check</div>', unsafe_allow_html=True)
+            EMAIL_SKIP = "— No email check —"
+            email_auto = next((c for c in ap_main_cols if 'email' in c.lower() or 'mail' in c.lower()), None)
+            email_options = [EMAIL_SKIP] + ap_main_cols
+            email_default = email_options.index(email_auto) if email_auto else 0
+            ap_email_col_choice = st.selectbox(
+                "Skip rows whose email already exists in the main list",
+                email_options,
+                index=email_default,
+                key="ap_email_col",
+            )
+            ap_email_col = None if ap_email_col_choice == EMAIL_SKIP else ap_email_col_choice
+            st.markdown("")
+
     ap_run = st.button("&#9889;  Append Lists", type="primary", use_container_width=True)
 
     if ap_run:
@@ -731,23 +747,36 @@ with tab2:
                     df_result = read_file(ap_main_file)
 
                 total_appended = 0
+                total_skipped  = 0
                 for ap_file in ap_new_files:
                     if ap_file.name not in ap_mappings:
                         continue
                     with st.spinner(f"Merging {ap_file.name}…"):
-                        df_ap_new = read_file(ap_file)
+                        df_ap_new   = read_file(ap_file)
+                        file_mapping = ap_mappings[ap_file.name]
+
+                        # Email deduplication filter
+                        if ap_email_col and ap_email_col in df_result.columns:
+                            email_source = file_mapping.get(ap_email_col, APPEND_SKIP)
+                            if email_source != APPEND_SKIP and email_source in df_ap_new.columns:
+                                existing_emails = set(
+                                    df_result[ap_email_col].dropna().astype(str).str.lower().str.strip()
+                                )
+                                mask = ~df_ap_new[email_source].astype(str).str.lower().str.strip().isin(existing_emails)
+                                total_skipped += (~mask).sum()
+                                df_ap_new = df_ap_new[mask].reset_index(drop=True)
+
                         rows_before = len(df_result)
-                        df_result = append_lists(df_result, df_ap_new, ap_mappings[ap_file.name])
+                        df_result = append_lists(df_result, df_ap_new, file_mapping)
                         total_appended += len(df_result) - rows_before
 
                 st.markdown('<div class="section-header">&#9632;&nbsp; Result</div>', unsafe_allow_html=True)
-                ap_s1, ap_s2, ap_s3 = st.columns(3, gap="small")
-                with ap_s1:
-                    st.markdown(f'<div class="stat-box"><div class="stat-num">{len(df_result) - total_appended:,}</div><div class="stat-label">Main rows</div></div>', unsafe_allow_html=True)
-                with ap_s2:
-                    st.markdown(f'<div class="stat-box"><div class="stat-num">{total_appended:,}</div><div class="stat-label">Appended rows</div></div>', unsafe_allow_html=True)
-                with ap_s3:
-                    st.markdown(f'<div class="stat-box"><div class="stat-num">{len(df_result):,}</div><div class="stat-label">Total rows</div></div>', unsafe_allow_html=True)
+                _stat_cols = st.columns(4 if total_skipped else 3, gap="small")
+                _stat_cols[0].markdown(f'<div class="stat-box"><div class="stat-num">{len(df_result) - total_appended:,}</div><div class="stat-label">Main rows</div></div>', unsafe_allow_html=True)
+                _stat_cols[1].markdown(f'<div class="stat-box"><div class="stat-num">{total_appended:,}</div><div class="stat-label">Appended rows</div></div>', unsafe_allow_html=True)
+                if total_skipped:
+                    _stat_cols[2].markdown(f'<div class="stat-box"><div class="stat-num warn">{total_skipped:,}</div><div class="stat-label">Skipped (email)</div></div>', unsafe_allow_html=True)
+                _stat_cols[-1].markdown(f'<div class="stat-box"><div class="stat-num">{len(df_result):,}</div><div class="stat-label">Total rows</div></div>', unsafe_allow_html=True)
 
                 st.markdown("")
                 st.dataframe(df_result.head(200), use_container_width=True, hide_index=True)
