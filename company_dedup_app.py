@@ -285,6 +285,10 @@ def normalize(name: str) -> str:
     n = re.sub(r'\s+', ' ', n).strip()
     return n
 
+def col_key(s: str) -> str:
+    """Normalize a column name for loose matching: lowercase, strip spaces/underscores/hyphens."""
+    return re.sub(r'[\s_\-]+', '', s.lower())
+
 def detect_company_col(columns) -> str:
     hints = ['company', 'name', 'organisation', 'organization', 'firm', 'account']
     for col in columns:
@@ -703,7 +707,7 @@ with tab2:
                         st.markdown("<small style='color:#2a3a4e;font-family:JetBrains Mono,monospace;text-transform:uppercase;letter-spacing:0.1em'>Column from this file</small>", unsafe_allow_html=True)
 
                     for mc in ap_main_cols:
-                        auto_match = next((c for c in ap_new_cols if c.lower() == mc.lower()), None)
+                        auto_match = next((c for c in ap_new_cols if col_key(c) == col_key(mc)), None)
                         default_idx = ap_new_cols.index(auto_match) + 1 if auto_match else 0
                         map_l, map_r = st.columns([1, 2])
                         with map_l:
@@ -722,7 +726,7 @@ with tab2:
             st.markdown("")
             st.markdown('<div class="section-header">&#9632;&nbsp; 04 &mdash; Email duplicate check</div>', unsafe_allow_html=True)
             EMAIL_SKIP = "— No email check —"
-            email_auto = next((c for c in ap_main_cols if 'email' in c.lower() or 'mail' in c.lower()), None)
+            email_auto = next((c for c in ap_main_cols if 'email' in col_key(c) or col_key(c) == 'mail'), None)
             email_options = [EMAIL_SKIP] + ap_main_cols
             email_default = email_options.index(email_auto) if email_auto else 0
             ap_email_col_choice = st.selectbox(
