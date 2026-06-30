@@ -603,7 +603,7 @@ def detect_company_col(columns) -> str:
             return col
     return columns[0]
 
-def read_file(f, nrows=None):
+def read_file(f, nrows=None, sheet_name=0):
     raw = f.read()
     if f.name.lower().endswith('.csv'):
         sample = raw[:4096].decode('utf-8', errors='replace')
@@ -617,7 +617,20 @@ def read_file(f, nrows=None):
             except (UnicodeDecodeError, LookupError):
                 pass
         return normalize_country_cols(pd.read_csv(io.BytesIO(raw), sep=sep, nrows=nrows, encoding='latin-1', encoding_errors='replace'))
-    return normalize_country_cols(pd.read_excel(io.BytesIO(raw), nrows=nrows))
+    return normalize_country_cols(pd.read_excel(io.BytesIO(raw), nrows=nrows, sheet_name=sheet_name))
+
+
+def get_excel_sheets(f):
+    """Return list of sheet names if Excel file has >1 sheet, else None."""
+    if f.name.lower().endswith('.csv'):
+        return None
+    try:
+        raw = f.read()
+        f.seek(0)
+        sheets = pd.ExcelFile(io.BytesIO(raw)).sheet_names
+        return sheets if len(sheets) > 1 else None
+    except Exception:
+        return None
 
 def find_matches(main_names, new_names, threshold):
     """
@@ -825,6 +838,22 @@ with tab1:
 
     st.markdown("")
 
+    # ── Sheet selection (Excel only) ────────────────────────────────────────────
+    main_sheet = 0
+    new_sheet  = 0
+
+    if main_file and not main_file.name.lower().endswith('.csv'):
+        _ms = get_excel_sheets(main_file)
+        if _ms:
+            main_sheet = st.selectbox("Sheet — Main database", _ms, key="main_sheet")
+            st.markdown("")
+
+    if new_file and not new_file.name.lower().endswith('.csv'):
+        _ns = get_excel_sheets(new_file)
+        if _ns:
+            new_sheet = st.selectbox("Sheet — New companies", _ns, key="new_sheet")
+            st.markdown("")
+
     # ── Column selection ────────────────────────────────────────────────────────
     main_col_choice    = None
     new_col_choice     = None
@@ -832,8 +861,8 @@ with tab1:
 
     if main_file and new_file:
         try:
-            main_cols = read_file(main_file, nrows=0).columns.tolist()
-            new_cols  = read_file(new_file,  nrows=0).columns.tolist()
+            main_cols = read_file(main_file, nrows=0, sheet_name=main_sheet).columns.tolist()
+            new_cols  = read_file(new_file,  nrows=0, sheet_name=new_sheet).columns.tolist()
             main_file.seek(0)
             new_file.seek(0)
 
@@ -889,8 +918,8 @@ with tab1:
         else:
             try:
                 with st.spinner("Reading files…"):
-                    df_main = read_file(main_file)
-                    df_new  = read_file(new_file)
+                    df_main = read_file(main_file, sheet_name=main_sheet)
+                    df_new  = read_file(new_file,  sheet_name=new_sheet)
 
                 main_col = main_col_choice or detect_company_col(df_main.columns.tolist())
                 new_col  = new_col_choice  or detect_company_col(df_new.columns.tolist())
@@ -1079,14 +1108,24 @@ with tab2:
 
     st.markdown("")
 
+    # ── Sheet selection (Excel only) ────────────────────────────────────────────
+    ap_main_sheet = 0
+
+    if ap_main_file and not ap_main_file.name.lower().endswith('.csv'):
+        _ams = get_excel_sheets(ap_main_file)
+        if _ams:
+            ap_main_sheet = st.selectbox("Sheet — Main list", _ams, key="ap_main_sheet")
+            st.markdown("")
+
     # ── Per-file column mapping ─────────────────────────────────────────────────
     ap_mappings  = {}   # {filename: {main_col: source_col | APPEND_SKIP}}
     ap_ranges    = {}   # {filename: (from_row, to_row)}  1-indexed, to_row=0 means all
+    ap_sheets    = {}   # {filename: sheet_name}
     ap_email_col = None
 
     if ap_main_file and ap_new_files:
         try:
-            ap_main_cols = read_file(ap_main_file, nrows=0).columns.tolist()
+            ap_main_cols = read_file(ap_main_file, nrows=0, sheet_name=ap_main_sheet).columns.tolist()
             ap_main_file.seek(0)
         except Exception:
             ap_main_cols = []
@@ -1098,8 +1137,20 @@ with tab2:
 
             for ap_file in ap_new_files:
                 with st.expander(f"**{ap_file.name}**", expanded=True):
+                    _ap_sheet = 0
+                    if not ap_file.name.lower().endswith('.csv'):
+                        _ap_file_sheets = get_excel_sheets(ap_file)
+                        if _ap_file_sheets:
+                            _ap_sheet = st.selectbox(
+                                "Sheet to use",
+                                _ap_file_sheets,
+                                key=f"ap_sheet_{ap_file.name}",
+                            )
+                            st.markdown("")
+                    ap_sheets[ap_file.name] = _ap_sheet
+
                     try:
-                        _ap_df_preview = read_file(ap_file)
+                        _ap_df_preview = read_file(ap_file, sheet_name=_ap_sheet)
                         ap_file.seek(0)
                         ap_new_cols   = _ap_df_preview.columns.tolist()
                         _ap_row_count = len(_ap_df_preview)
@@ -1174,7 +1225,7 @@ with tab2:
         else:
             try:
                 with st.spinner("Reading files…"):
-                    df_result = read_file(ap_main_file)
+                    df_result = read_file(ap_main_file, sheet_name=ap_main_sheet)
 
                 total_appended = 0
                 total_skipped  = 0
@@ -1182,7 +1233,7 @@ with tab2:
                     if ap_file.name not in ap_mappings:
                         continue
                     with st.spinner(f"Merging {ap_file.name}…"):
-                        df_ap_new   = read_file(ap_file)
+                        df_ap_new   = read_file(ap_file, sheet_name=ap_sheets.get(ap_file.name, 0))
                         file_mapping = ap_mappings[ap_file.name]
 
                         # Apply row range (1-indexed)
