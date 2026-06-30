@@ -1178,12 +1178,17 @@ with tab2:
                         if ap_email_col and ap_email_col in df_result.columns:
                             email_source = file_mapping.get(ap_email_col, APPEND_SKIP)
                             if email_source != APPEND_SKIP and email_source in df_ap_new.columns:
+                                # Check against main list + all previously appended rows
                                 existing_emails = set(
                                     df_result[ap_email_col].dropna().astype(str).str.lower().str.strip()
                                 )
                                 mask = ~df_ap_new[email_source].astype(str).str.lower().str.strip().isin(existing_emails)
                                 total_skipped += (~mask).sum()
                                 df_ap_new = df_ap_new[mask].reset_index(drop=True)
+                                # Also deduplicate within this file itself
+                                before_internal = len(df_ap_new)
+                                df_ap_new = df_ap_new.drop_duplicates(subset=[email_source], keep='first').reset_index(drop=True)
+                                total_skipped += before_internal - len(df_ap_new)
 
                         rows_before = len(df_result)
                         df_result = append_lists(df_result, df_ap_new, file_mapping)
