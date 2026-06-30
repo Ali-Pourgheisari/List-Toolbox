@@ -603,39 +603,24 @@ def detect_company_col(columns) -> str:
             return col
     return columns[0]
 
-def _detect_encoding(raw: bytes) -> str:
-    try:
-        import chardet
-        result = chardet.detect(raw)
-        enc = result.get('encoding') or 'utf-8'
-        return 'utf-8' if enc.lower() == 'ascii' else enc
-    except ImportError:
-        return 'utf-8'
-
 def read_file(f, nrows=None):
-    raw = f.read()
-    f.seek(0)
-
     if f.name.lower().endswith('.csv'):
-        # Detect separator from first 4 KB
-        sample = raw[:4096].decode('utf-8', errors='replace')
+        sample = f.read(4096).decode('utf-8', errors='replace')
+        f.seek(0)
         try:
             sep = csv.Sniffer().sniff(sample, delimiters=',;').delimiter
         except csv.Error:
             sep = ','
-
-        detected = _detect_encoding(raw)
-        for encoding in dict.fromkeys([detected, 'utf-8-sig', 'utf-8', 'cp1252', 'latin-1']):
+        for encoding in ('utf-8', 'cp1252', 'latin-1'):
             try:
+                df = pd.read_csv(f, sep=sep, nrows=nrows, encoding=encoding)
+                return normalize_country_cols(df)
+            except UnicodeDecodeError:
                 f.seek(0)
-                return normalize_country_cols(pd.read_csv(f, sep=sep, nrows=nrows, encoding=encoding))
-            except (UnicodeDecodeError, LookupError):
-                pass
-
         f.seek(0)
         return normalize_country_cols(pd.read_csv(f, sep=sep, nrows=nrows, encoding='latin-1', encoding_errors='replace'))
-
-    return normalize_country_cols(pd.read_excel(io.BytesIO(raw), nrows=nrows))
+    f.seek(0)
+    return normalize_country_cols(pd.read_excel(f, nrows=nrows))
 
 def find_matches(main_names, new_names, threshold):
     """
