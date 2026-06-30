@@ -1227,6 +1227,7 @@ with tab2:
                 with st.spinner("Reading files…"):
                     df_result = read_file(ap_main_file, sheet_name=ap_main_sheet)
 
+                _original_main_rows = len(df_result)
                 total_appended = 0
                 total_skipped  = 0
                 for ap_file in ap_new_files:
@@ -1278,9 +1279,10 @@ with tab2:
                 _stat_cols[-1].markdown(f'<div class="stat-box"><div class="stat-num">{len(df_result):,}</div><div class="stat-label">Total rows</div></div>', unsafe_allow_html=True)
 
                 st.markdown("")
-                st.dataframe(df_result.head(200), use_container_width=True, hide_index=True)
-                if len(df_result) > 200:
-                    st.markdown(f"<small style='color:#3a4a5e'>Showing first 200 of {len(df_result):,} rows.</small>", unsafe_allow_html=True)
+                _df_new_rows = df_result.iloc[_original_main_rows:].reset_index(drop=True)
+                st.dataframe(_df_new_rows.head(200), use_container_width=True, hide_index=True)
+                if len(_df_new_rows) > 200:
+                    st.markdown(f"<small style='color:#3a4a5e'>Showing first 200 of {len(_df_new_rows):,} new rows.</small>", unsafe_allow_html=True)
 
                 st.markdown("")
                 ap_dl_a, ap_dl_b = st.columns(2, gap="small")
