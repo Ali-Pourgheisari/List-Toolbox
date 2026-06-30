@@ -607,15 +607,8 @@ def _detect_encoding(raw: bytes) -> str:
     try:
         import chardet
         result = chardet.detect(raw)
-        enc = (result.get('encoding') or 'utf-8').lower()
-        confidence = result.get('confidence', 0)
-        # 'ascii' is always safe to promote to utf-8
-        if enc == 'ascii':
-            return 'utf-8'
-        # Low-confidence guesses cause more harm than good — default to utf-8
-        if confidence < 0.7:
-            return 'utf-8'
-        return enc
+        enc = result.get('encoding') or 'utf-8'
+        return 'utf-8' if enc.lower() == 'ascii' else enc
     except ImportError:
         return 'utf-8'
 
@@ -634,16 +627,15 @@ def read_file(f, nrows=None):
         detected = _detect_encoding(raw)
         for encoding in dict.fromkeys([detected, 'utf-8-sig', 'utf-8', 'cp1252', 'latin-1']):
             try:
-                df = pd.read_csv(io.BytesIO(raw), sep=sep, nrows=nrows, encoding=encoding)
-                return normalize_country_cols(df)
+                f.seek(0)
+                return normalize_country_cols(pd.read_csv(f, sep=sep, nrows=nrows, encoding=encoding))
             except (UnicodeDecodeError, LookupError):
                 pass
 
-        df = pd.read_csv(io.BytesIO(raw), sep=sep, nrows=nrows, encoding='latin-1', encoding_errors='replace')
-        return normalize_country_cols(df)
+        f.seek(0)
+        return normalize_country_cols(pd.read_csv(f, sep=sep, nrows=nrows, encoding='latin-1', encoding_errors='replace'))
 
-    df = pd.read_excel(io.BytesIO(raw), nrows=nrows)
-    return normalize_country_cols(df)
+    return normalize_country_cols(pd.read_excel(io.BytesIO(raw), nrows=nrows))
 
 def find_matches(main_names, new_names, threshold):
     """
