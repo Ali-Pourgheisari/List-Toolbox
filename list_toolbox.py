@@ -578,7 +578,10 @@ def clean_for_output(name: str) -> str:
     n = re.sub(r'\(\s*[Dd]emo[^)]*\)', '', n)   # (Demo Account), (Demo: 34708)
     n = re.sub(r'\b\d{4,}\b', '', n)             # standalone 4+ digit IDs
     n = re.sub(r'\s*\d+\s*$', '', n)             # trailing numbers
+    n = re.sub(r'^\s*\d+\s*', '', n)             # leading numbers
     n = re.sub(r'\(\s*\)', '', n)                # leftover empty parentheses
+    n = re.sub(r'^\s*[-–—]\s*', '', n)           # leading dash left after number removal
+    n = re.sub(r'\s*[-–—]\s*$', '', n)           # trailing dash left after number removal
     n = re.sub(r'\s+', ' ', n).strip()
     return n
 
