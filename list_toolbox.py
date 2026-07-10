@@ -368,7 +368,8 @@ SUFFIXES = re.compile(
 )
 
 RESULTS_SESSION_KEY = "screener_results"
-MOVED_SESSION_KEY = "screener_moved_match_ids"
+MOVED_SESSION_KEY   = "screener_moved_match_ids"
+DUP_RESCUED_KEY     = "screener_rescued_dup_ids"
 
 # ── Country normalisation ─────────────────────────────────────────────────────
 # Maps every known variant (lowercase) → canonical short code.
@@ -695,13 +696,16 @@ def find_internal_duplicates(names: list, threshold: int) -> list:
 
 
 def store_results(payload: dict) -> None:
-    previous_payload = st.session_state.get(RESULTS_SESSION_KEY)
-    previous_moved = list(st.session_state.get(MOVED_SESSION_KEY, []))
+    previous_payload  = st.session_state.get(RESULTS_SESSION_KEY)
+    previous_moved    = list(st.session_state.get(MOVED_SESSION_KEY, []))
+    previous_rescued  = list(st.session_state.get(DUP_RESCUED_KEY, []))
     st.session_state[RESULTS_SESSION_KEY] = payload
     if previous_payload and previous_payload.get("signature") == payload.get("signature"):
         st.session_state[MOVED_SESSION_KEY] = previous_moved
+        st.session_state[DUP_RESCUED_KEY]   = previous_rescued
     else:
         st.session_state[MOVED_SESSION_KEY] = []
+        st.session_state[DUP_RESCUED_KEY]   = []
 
 
 def get_visible_results():
@@ -713,10 +717,12 @@ def get_visible_results():
     promoted = [item for item in payload["matches"] if item["id"] in moved_ids]
     remaining_matches = [item for item in payload["matches"] if item["id"] not in moved_ids]
 
-    internal_dups = payload.get("internal_dups", [])
-    dup_ids = {item["id_dup"] for item in internal_dups}
-    clean_unique = [idx for idx in payload["unique_new"] if idx not in dup_ids]
-    unique_indices = clean_unique + [item["id"] for item in promoted]
+    internal_dups    = payload.get("internal_dups", [])
+    rescued_dup_ids  = set(st.session_state.get(DUP_RESCUED_KEY, []))
+    dup_ids          = {item["id_dup"] for item in internal_dups if item["id_dup"] not in rescued_dup_ids}
+    clean_unique     = [idx for idx in payload["unique_new"] if idx not in dup_ids]
+    rescued_indices  = [item["id_dup"] for item in internal_dups if item["id_dup"] in rescued_dup_ids]
+    unique_indices   = clean_unique + [item["id"] for item in promoted] + rescued_indices
 
     return {
         "signature": payload["signature"],
@@ -728,6 +734,7 @@ def get_visible_results():
         "df_new_valid": payload["df_new_valid"],
         "new_col": payload["new_col"],
         "internal_dups": internal_dups,
+        "rescued_dup_ids": rescued_dup_ids,
     }
 
 
@@ -743,6 +750,20 @@ def demote_match(match_id: int) -> None:
     if match_id in moved_ids:
         moved_ids.remove(match_id)
         st.session_state[MOVED_SESSION_KEY] = moved_ids
+
+
+def rescue_dup(dup_id: int) -> None:
+    rescued = list(st.session_state.get(DUP_RESCUED_KEY, []))
+    if dup_id not in rescued:
+        rescued.append(dup_id)
+        st.session_state[DUP_RESCUED_KEY] = rescued
+
+
+def unrescue_dup(dup_id: int) -> None:
+    rescued = list(st.session_state.get(DUP_RESCUED_KEY, []))
+    if dup_id in rescued:
+        rescued.remove(dup_id)
+        st.session_state[DUP_RESCUED_KEY] = rescued
 
 
 APPEND_SKIP = "— Skip / leave empty —"
@@ -981,9 +1002,11 @@ with tab1:
         df_new_valid      = visible_results["df_new_valid"]
         new_col           = visible_results["new_col"]
         internal_dups     = visible_results.get("internal_dups", [])
+        rescued_dup_ids   = visible_results.get("rescued_dup_ids", set())
 
         st.markdown('<div class="section-header">&#9632;&nbsp; Results</div>', unsafe_allow_html=True)
 
+        _active_dups = len([d for d in internal_dups if d["id_dup"] not in rescued_dup_ids])
         s1, s2, s3, s4, s5 = st.columns(5, gap="small")
         with s1:
             st.markdown(f'<div class="stat-box"><div class="stat-num">{len(visible_results["main_names"]):,}</div><div class="stat-label">Main DB</div></div>', unsafe_allow_html=True)
@@ -992,7 +1015,7 @@ with tab1:
         with s3:
             st.markdown(f'<div class="stat-box"><div class="stat-num warn">{len(remaining_matches):,}</div><div class="stat-label">In Main DB</div></div>', unsafe_allow_html=True)
         with s4:
-            st.markdown(f'<div class="stat-box"><div class="stat-num warn">{len(internal_dups):,}</div><div class="stat-label">List Dups</div></div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="stat-box"><div class="stat-num warn">{_active_dups:,}</div><div class="stat-label">List Dups</div></div>', unsafe_allow_html=True)
         with s5:
             st.markdown(f'<div class="stat-box"><div class="stat-num">{len(unique_indices):,}</div><div class="stat-label">Clean &amp; Unique</div></div>', unsafe_allow_html=True)
 
@@ -1077,19 +1100,31 @@ with tab1:
         if internal_dups:
             st.markdown("")
             st.markdown('<div class="section-header">&#9664;&#9654;&nbsp; Duplicates within the new list</div>', unsafe_allow_html=True)
-            st.markdown("<small style='color:#3a4a5e'>These pairs are fuzzy duplicates of each other inside the uploaded file. Only the first occurrence is kept in the output — the duplicate is excluded.</small>", unsafe_allow_html=True)
+            st.markdown("<small style='color:#3a4a5e'>These pairs are fuzzy duplicates of each other. Only the first occurrence is kept — click <strong>Keep Both</strong> if they are not actually the same company.</small>", unsafe_allow_html=True)
             st.markdown("")
             for dup in sorted(internal_dups, key=lambda d: -d["score"]):
+                is_rescued  = dup["id_dup"] in rescued_dup_ids
                 score_class = "high" if dup["score"] >= 90 else ""
-                st.markdown(f"""
-                <div class="match-card">
-                  <span class="match-names">
-                    <span class="match-main">{dup["name_keeper"]}</span>
-                    <span class="match-arrow"> &lArr; dup &mdash; </span>
-                    {dup["name_dup"]}
-                  </span>
-                  <span class="match-score {score_class}">{dup["score"]}%</span>
-                </div>""", unsafe_allow_html=True)
+                dup_l, dup_r = st.columns([0.82, 0.18])
+                with dup_l:
+                    st.markdown(f"""
+                    <div class="match-card" style="{'opacity:0.45' if is_rescued else ''}">
+                      <span class="match-names">
+                        <span class="match-main">{dup["name_keeper"]}</span>
+                        <span class="match-arrow"> &lArr; dup &mdash; </span>
+                        {dup["name_dup"]}
+                      </span>
+                      <span class="match-score {score_class}">{dup["score"]}%</span>
+                    </div>""", unsafe_allow_html=True)
+                with dup_r:
+                    if is_rescued:
+                        if st.button("Return", key=f"unrescue_dup_{dup['id_dup']}", type="secondary"):
+                            unrescue_dup(dup["id_dup"])
+                            st.rerun()
+                    else:
+                        if st.button("Keep Both", key=f"rescue_dup_{dup['id_dup']}", type="secondary"):
+                            rescue_dup(dup["id_dup"])
+                            st.rerun()
 
     else:
         st.markdown("""
