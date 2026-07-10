@@ -1055,7 +1055,7 @@ with tab1:
                 st.markdown("")
                 dl_a, dl_b = st.columns(2, gap="small")
                 csv_bytes = df_out.to_csv(index=False).encode("utf-8-sig")
-                _src_name = visible_results["signature"].get("new_file", "output")
+                _src_name = visible_results["signature"].get("main_file", "output")
                 with dl_a:
                     st.download_button(
                         label="&#11015;  Download CSV",
