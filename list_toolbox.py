@@ -837,12 +837,11 @@ with tab1:
 
     with col_b:
         st.markdown('<div class="upload-label">&#9632;&nbsp; 02 &mdash; New companies</div>', unsafe_allow_html=True)
-        new_file  = st.file_uploader("New companies to check", type=["xlsx", "xls", "csv"], key="new",
-                                      label_visibility="collapsed")
-        if isinstance(new_file, list):
-            if len(new_file) > 1:
-                st.warning("Only one file is allowed here. Using the first file.")
-            new_file = new_file[0] if new_file else None
+        new_files = st.file_uploader("New companies to check", type=["xlsx", "xls", "csv"], key="new",
+                                      accept_multiple_files=True, label_visibility="collapsed")
+        if not isinstance(new_files, list):
+            new_files = [new_files] if new_files else []
+        new_file = new_files[0] if new_files else None
 
     st.markdown("")
 
@@ -867,12 +866,15 @@ with tab1:
     new_col_choice     = None
     output_col_choices = None
 
-    if main_file and new_file:
+    if main_file and new_files:
+        if len(new_files) > 1:
+            st.info(f"{len(new_files)} files will be combined and screened together. Column configuration is based on the first file.")
         try:
             main_cols = read_file(main_file, nrows=0, sheet_name=main_sheet).columns.tolist()
-            new_cols  = read_file(new_file,  nrows=0, sheet_name=new_sheet).columns.tolist()
+            new_cols  = read_file(new_files[0], nrows=0, sheet_name=new_sheet).columns.tolist()
             main_file.seek(0)
-            new_file.seek(0)
+            for _nf in new_files:
+                _nf.seek(0)
 
             st.markdown('<div class="section-header">&#9632;&nbsp; 03 &mdash; Column to compare</div>', unsafe_allow_html=True)
             col_sel_a, col_sel_b = st.columns(2, gap="medium")
@@ -921,13 +923,20 @@ with tab1:
     run = st.button("&#9889;  Run Screening", type="primary", use_container_width=True)
 
     if run:
-        if not main_file or not new_file:
+        if not main_file or not new_files:
             st.error("Please upload both files before running.")
         else:
             try:
                 with st.spinner("Reading files…"):
                     df_main = read_file(main_file, sheet_name=main_sheet)
-                    df_new  = read_file(new_file,  sheet_name=new_sheet)
+                    if len(new_files) == 1:
+                        df_new = read_file(new_files[0], sheet_name=new_sheet)
+                    else:
+                        _dfs_new = []
+                        for _i, _nf in enumerate(new_files):
+                            _nf.seek(0)
+                            _dfs_new.append(read_file(_nf, sheet_name=new_sheet if _i == 0 else 0))
+                        df_new = pd.concat(_dfs_new, ignore_index=True)
 
                 main_col = main_col_choice or detect_company_col(df_main.columns.tolist())
                 new_col  = new_col_choice  or detect_company_col(df_new.columns.tolist())
@@ -946,8 +955,8 @@ with tab1:
                     "signature": {
                         "main_file": getattr(main_file, "name", ""),
                         "main_size": getattr(main_file, "size", None),
-                        "new_file": getattr(new_file, "name", ""),
-                        "new_size": getattr(new_file, "size", None),
+                        "new_file": new_files[0].name if new_files else "",
+                        "new_size": sum(getattr(_nf, "size", 0) for _nf in new_files),
                         "threshold": threshold,
                     },
                     "main_names": main_names,
