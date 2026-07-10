@@ -1066,6 +1066,7 @@ with tab1:
                         file_name=_output_filename(_src_name, ".csv"),
                         mime="text/csv",
                         use_container_width=True,
+                        key="screener_dl_csv",
                     )
                 with dl_b:
                     excel_buf = io.BytesIO()
@@ -1077,6 +1078,7 @@ with tab1:
                         file_name=_output_filename(_src_name, ".xlsx"),
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         use_container_width=True,
+                        key="screener_dl_xlsx",
                     )
             else:
                 st.info("All companies in the new file already exist in the main list.")
@@ -1350,6 +1352,7 @@ with tab2:
                         file_name=_output_filename(_ap_src_name, ".csv"),
                         mime="text/csv",
                         use_container_width=True,
+                        key="appender_dl_csv",
                     )
                 with ap_dl_b:
                     ap_excel_buf = io.BytesIO()
@@ -1361,6 +1364,7 @@ with tab2:
                         file_name=_output_filename(_ap_src_name, ".xlsx"),
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         use_container_width=True,
+                        key="appender_dl_xlsx",
                     )
 
             except Exception as e:
