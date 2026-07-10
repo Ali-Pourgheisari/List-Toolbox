@@ -830,11 +830,19 @@ with tab1:
         st.markdown('<div class="upload-label">&#9632;&nbsp; 01 &mdash; Main database</div>', unsafe_allow_html=True)
         main_file = st.file_uploader("Main database", type=["xlsx", "xls", "csv"], key="main",
                                       label_visibility="collapsed")
+        if isinstance(main_file, list):
+            if len(main_file) > 1:
+                st.warning("Only one file is allowed here. Using the first file.")
+            main_file = main_file[0] if main_file else None
 
     with col_b:
         st.markdown('<div class="upload-label">&#9632;&nbsp; 02 &mdash; New companies</div>', unsafe_allow_html=True)
         new_file  = st.file_uploader("New companies to check", type=["xlsx", "xls", "csv"], key="new",
                                       label_visibility="collapsed")
+        if isinstance(new_file, list):
+            if len(new_file) > 1:
+                st.warning("Only one file is allowed here. Using the first file.")
+            new_file = new_file[0] if new_file else None
 
     st.markdown("")
 
