@@ -1057,30 +1057,15 @@ with tab1:
                                 st.rerun()
 
                 st.markdown("")
-                dl_a, dl_b = st.columns(2, gap="small")
-                csv_bytes = df_out.to_csv(index=False).encode("utf-8-sig")
                 _src_name = visible_results["signature"].get("main_file", "output")
-                with dl_a:
-                    st.download_button(
-                        label="&#11015;  Download CSV",
-                        data=csv_bytes,
-                        file_name=_output_filename(_src_name, ".csv"),
-                        mime="text/csv",
-                        use_container_width=True,
-                        key="screener_dl_csv",
-                    )
-                with dl_b:
-                    excel_buf = io.BytesIO()
-                    with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
-                        df_out.to_excel(writer, index=False, sheet_name="Unique Companies")
-                    st.download_button(
-                        label="&#11015;  Download Excel",
-                        data=excel_buf.getvalue(),
-                        file_name=_output_filename(_src_name, ".xlsx"),
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True,
-                        key="screener_dl_xlsx",
-                    )
+                st.download_button(
+                    label="&#11015;  Download CSV",
+                    data=df_out.to_csv(index=False).encode("utf-8-sig"),
+                    file_name=_output_filename(_src_name, ".csv"),
+                    mime="text/csv",
+                    use_container_width=True,
+                    key="screener_dl_csv",
+                )
             else:
                 st.info("All companies in the new file already exist in the main list.")
 
@@ -1441,28 +1426,14 @@ with tab2:
                 # ── Download ───────────────────────────────────────────────────
                 _src_name, _df_res = _results[0][0], _results[0][1]
                 if len(_results) == 1:
-                    _dl_a, _dl_b = st.columns(2, gap="small")
-                    with _dl_a:
-                        st.download_button(
-                            label="&#11015;  Download CSV",
-                            data=_df_res.to_csv(index=False).encode("utf-8-sig"),
-                            file_name=_output_filename(_src_name, ".csv"),
-                            mime="text/csv",
-                            use_container_width=True,
-                            key="appender_dl_csv",
-                        )
-                    with _dl_b:
-                        _xlsx_buf = io.BytesIO()
-                        with pd.ExcelWriter(_xlsx_buf, engine="openpyxl") as _writer:
-                            _df_res.to_excel(_writer, index=False, sheet_name="Appended List")
-                        st.download_button(
-                            label="&#11015;  Download Excel",
-                            data=_xlsx_buf.getvalue(),
-                            file_name=_output_filename(_src_name, ".xlsx"),
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            use_container_width=True,
-                            key="appender_dl_xlsx",
-                        )
+                    st.download_button(
+                        label="&#11015;  Download CSV",
+                        data=_df_res.to_csv(index=False).encode("utf-8-sig"),
+                        file_name=_output_filename(_src_name, ".csv"),
+                        mime="text/csv",
+                        use_container_width=True,
+                        key="appender_dl_csv",
+                    )
                 else:
                     _zip_buf = io.BytesIO()
                     with zipfile.ZipFile(_zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as _zf:
@@ -1471,10 +1442,6 @@ with tab2:
                                 _output_filename(_sn, ".csv"),
                                 _df.to_csv(index=False).encode("utf-8-sig"),
                             )
-                            _xlsx_buf = io.BytesIO()
-                            with pd.ExcelWriter(_xlsx_buf, engine="openpyxl") as _writer:
-                                _df.to_excel(_writer, index=False, sheet_name="Appended List")
-                            _zf.writestr(_output_filename(_sn, ".xlsx"), _xlsx_buf.getvalue())
                     st.download_button(
                         label="&#11015;  Download all (ZIP)",
                         data=_zip_buf.getvalue(),
