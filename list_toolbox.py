@@ -553,21 +553,16 @@ def normalize_country_cols(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def _output_filename(source_name: str, ext: str) -> str:
-    """
-    Build a download filename from source_name:
-    strip the file extension, remove any trailing date, append today's date.
-    ext should include the dot, e.g. '.csv' or '.xlsx'.
-    """
     stem = source_name
     for e in ('.xlsx', '.xls', '.csv'):
         if stem.lower().endswith(e):
             stem = stem[:-len(e)]
             break
-    # Strip trailing date in common formats: YYYY-MM-DD, DD-MM-YYYY, YYYYMMDD
     stem = re.sub(r'[\s_\-]+\d{4}[\-_\.]\d{2}[\-_\.]\d{2}$', '', stem)
     stem = re.sub(r'[\s_\-]+\d{2}[\-_\.]\d{2}[\-_\.]\d{4}$', '', stem)
     stem = re.sub(r'[\s_\-]+\d{8}$', '', stem)
-    stem = stem.rstrip(' _-')
+    stem = re.sub(r'[^\w]', '_', stem)
+    stem = re.sub(r'_+', '_', stem).strip('_') or 'output'
     return f"{stem}_{date.today().strftime('%Y-%m-%d')}{ext}"
 
 
@@ -1425,17 +1420,15 @@ with tab2:
                         st.markdown(f"<small style='color:#3a4a5e'>Showing first 200 of {len(_df_new_rows):,} new rows.</small>", unsafe_allow_html=True)
                     st.markdown("")
 
-                # ── Download ───────────────────────────────────────────────────
-                _src_name, _df_res = _results[0][0], _results[0][1]
+                # ── Serialise download data into session state ─────────────────
                 if len(_results) == 1:
-                    st.download_button(
-                        label="&#11015;  Download CSV",
-                        data=_df_res.to_csv(index=False).encode("utf-8-sig"),
-                        file_name=_output_filename(_src_name, ".csv"),
-                        mime="text/csv",
-                        use_container_width=True,
-                        key="appender_dl_csv",
-                    )
+                    _sn, _df = _results[0][0], _results[0][1]
+                    st.session_state["ap_dl"] = {
+                        "data":  _df.to_csv(index=False).encode("utf-8-sig"),
+                        "name":  _output_filename(_sn, ".csv"),
+                        "mime":  "text/csv",
+                        "label": "&#11015;  Download CSV",
+                    }
                 else:
                     _zip_buf = io.BytesIO()
                     with zipfile.ZipFile(_zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as _zf:
@@ -1444,19 +1437,28 @@ with tab2:
                                 _output_filename(_sn, ".csv"),
                                 _df.to_csv(index=False).encode("utf-8-sig"),
                             )
-                    st.download_button(
-                        label="&#11015;  Download all (ZIP)",
-                        data=_zip_buf.getvalue(),
-                        file_name="appended_lists.zip",
-                        mime="application/zip",
-                        use_container_width=True,
-                        key="appender_dl_zip",
-                    )
-                st.markdown("")
+                    st.session_state["ap_dl"] = {
+                        "data":  _zip_buf.getvalue(),
+                        "name":  "appended_lists.zip",
+                        "mime":  "application/zip",
+                        "label": "&#11015;  Download all (ZIP)",
+                    }
 
             except Exception as e:
                 st.error(f"Something went wrong: {e}")
                 st.exception(e)
+
+    if st.session_state.get("ap_dl"):
+        _dl = st.session_state["ap_dl"]
+        st.download_button(
+            label=_dl["label"],
+            data=_dl["data"],
+            file_name=_dl["name"],
+            mime=_dl["mime"],
+            use_container_width=True,
+            key="appender_dl",
+        )
+        st.markdown("")
 
     elif not (ap_main_file_1 and ap_new_files):
         st.markdown("""
