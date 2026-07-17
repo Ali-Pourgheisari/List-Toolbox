@@ -1356,6 +1356,7 @@ with tab2:
         else:
             try:
                 def _do_append(main_file, main_sheet, mappings, email_col):
+                    main_file.seek(0)
                     df_result = read_file(main_file, sheet_name=main_sheet)
                     original_rows  = len(df_result)
                     total_appended = 0
@@ -1364,6 +1365,7 @@ with tab2:
                         if ap_file.name not in mappings:
                             continue
                         with st.spinner(f"Merging {ap_file.name} → {main_file.name}…"):
+                            ap_file.seek(0)
                             df_ap_new    = read_file(ap_file, sheet_name=ap_sheets.get(ap_file.name, 0))
                             file_mapping = mappings[ap_file.name]
 
