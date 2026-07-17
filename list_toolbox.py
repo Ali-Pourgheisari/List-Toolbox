@@ -1152,20 +1152,31 @@ with tab2:
 </div>""", unsafe_allow_html=True)
 
     # ── Upload ─────────────────────────────────────────────────────────────────
-    ap_col_a, ap_col_b, ap_col_c = st.columns(3, gap="medium")
+    if "ap_num_main" not in st.session_state:
+        st.session_state["ap_num_main"] = 1
 
-    with ap_col_a:
-        st.markdown('<div class="upload-label">&#9632;&nbsp; 01 &mdash; Main list 1</div>', unsafe_allow_html=True)
+    ap_col_main, ap_col_new = st.columns(2, gap="medium")
+
+    with ap_col_main:
+        st.markdown('<div class="upload-label">&#9632;&nbsp; 01 &mdash; Main list(s)</div>', unsafe_allow_html=True)
         ap_main_file_1 = st.file_uploader("Main list 1", type=["xlsx", "xls", "csv"], key="ap_main_1",
                                            label_visibility="collapsed")
+        if st.session_state["ap_num_main"] >= 2:
+            st.markdown("<div style='margin-top:0.3rem'></div>", unsafe_allow_html=True)
+            ap_main_file_2 = st.file_uploader("Main list 2", type=["xlsx", "xls", "csv"], key="ap_main_2",
+                                               label_visibility="collapsed")
+            if st.button("✕  Remove second list", key="ap_remove_main", use_container_width=True):
+                st.session_state["ap_num_main"] = 1
+                st.session_state.pop("ap_main_2", None)
+                st.rerun()
+        else:
+            ap_main_file_2 = None
+            if st.button("＋  Add second main list", key="ap_add_main", use_container_width=True):
+                st.session_state["ap_num_main"] = 2
+                st.rerun()
 
-    with ap_col_b:
-        st.markdown('<div class="upload-label">&#9632;&nbsp; 02 &mdash; Main list 2 <small style="color:#3a4a5e;font-weight:normal">(optional)</small></div>', unsafe_allow_html=True)
-        ap_main_file_2 = st.file_uploader("Main list 2", type=["xlsx", "xls", "csv"], key="ap_main_2",
-                                           label_visibility="collapsed")
-
-    with ap_col_c:
-        st.markdown('<div class="upload-label">&#9632;&nbsp; 03 &mdash; Files to append</div>', unsafe_allow_html=True)
+    with ap_col_new:
+        st.markdown('<div class="upload-label">&#9632;&nbsp; 02 &mdash; Files to append</div>', unsafe_allow_html=True)
         ap_new_files = st.file_uploader("Files to append", type=["xlsx", "xls", "csv"], key="ap_new",
                                          accept_multiple_files=True, label_visibility="collapsed")
 
@@ -1222,7 +1233,7 @@ with tab2:
             ap_main_cols_2 = []
 
         if ap_main_cols_1:
-            st.markdown('<div class="section-header">&#9632;&nbsp; 04 &mdash; Column mapping</div>', unsafe_allow_html=True)
+            st.markdown('<div class="section-header">&#9632;&nbsp; 03 &mdash; Column mapping</div>', unsafe_allow_html=True)
             st.markdown("<small style='color:#3a4a5e'>For every column in each main list, pick the matching column from the file to append — or skip it.</small>", unsafe_allow_html=True)
             st.markdown("")
 
@@ -1314,7 +1325,7 @@ with tab2:
                     ap_ranges[ap_file.name] = (int(_from), int(_to))
 
             st.markdown("")
-            st.markdown('<div class="section-header">&#9632;&nbsp; 05 &mdash; Email duplicate check</div>', unsafe_allow_html=True)
+            st.markdown('<div class="section-header">&#9632;&nbsp; 04 &mdash; Email duplicate check</div>', unsafe_allow_html=True)
             EMAIL_SKIP = "— No email check —"
             _email_cols = st.columns(2 if ap_main_cols_2 else 1, gap="small")
 
