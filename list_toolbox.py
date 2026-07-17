@@ -1438,27 +1438,51 @@ with tab2:
                         st.markdown(f"<small style='color:#3a4a5e'>Showing first 200 of {len(_df_new_rows):,} new rows.</small>", unsafe_allow_html=True)
                     st.markdown("")
 
-                # ── Build ZIP with CSV + Excel for every result ────────────────
-                _zip_buf = io.BytesIO()
-                with zipfile.ZipFile(_zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as _zf:
-                    for _src_name, _df_res, _, _, _ in _results:
-                        _zf.writestr(
-                            _output_filename(_src_name, ".csv"),
-                            _df_res.to_csv(index=False).encode("utf-8-sig"),
+                # ── Download ───────────────────────────────────────────────────
+                _src_name, _df_res = _results[0][0], _results[0][1]
+                if len(_results) == 1:
+                    _dl_a, _dl_b = st.columns(2, gap="small")
+                    with _dl_a:
+                        st.download_button(
+                            label="&#11015;  Download CSV",
+                            data=_df_res.to_csv(index=False).encode("utf-8-sig"),
+                            file_name=_output_filename(_src_name, ".csv"),
+                            mime="text/csv",
+                            use_container_width=True,
+                            key="appender_dl_csv",
                         )
+                    with _dl_b:
                         _xlsx_buf = io.BytesIO()
                         with pd.ExcelWriter(_xlsx_buf, engine="openpyxl") as _writer:
                             _df_res.to_excel(_writer, index=False, sheet_name="Appended List")
-                        _zf.writestr(_output_filename(_src_name, ".xlsx"), _xlsx_buf.getvalue())
-
-                st.download_button(
-                    label="&#11015;  Download all (ZIP)",
-                    data=_zip_buf.getvalue(),
-                    file_name="appended_lists.zip",
-                    mime="application/zip",
-                    use_container_width=True,
-                    key="appender_dl_zip",
-                )
+                        st.download_button(
+                            label="&#11015;  Download Excel",
+                            data=_xlsx_buf.getvalue(),
+                            file_name=_output_filename(_src_name, ".xlsx"),
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True,
+                            key="appender_dl_xlsx",
+                        )
+                else:
+                    _zip_buf = io.BytesIO()
+                    with zipfile.ZipFile(_zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as _zf:
+                        for _sn, _df, _, _, _ in _results:
+                            _zf.writestr(
+                                _output_filename(_sn, ".csv"),
+                                _df.to_csv(index=False).encode("utf-8-sig"),
+                            )
+                            _xlsx_buf = io.BytesIO()
+                            with pd.ExcelWriter(_xlsx_buf, engine="openpyxl") as _writer:
+                                _df.to_excel(_writer, index=False, sheet_name="Appended List")
+                            _zf.writestr(_output_filename(_sn, ".xlsx"), _xlsx_buf.getvalue())
+                    st.download_button(
+                        label="&#11015;  Download all (ZIP)",
+                        data=_zip_buf.getvalue(),
+                        file_name="appended_lists.zip",
+                        mime="application/zip",
+                        use_container_width=True,
+                        key="appender_dl_zip",
+                    )
                 st.markdown("")
 
             except Exception as e:
