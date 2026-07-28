@@ -372,6 +372,9 @@ RESULTS_SESSION_KEY = "screener_results"
 MOVED_SESSION_KEY   = "screener_moved_match_ids"
 DUP_RESCUED_KEY     = "screener_rescued_dup_ids"
 
+APPEND_RESULTS_KEY = "appender_results"
+APPEND_RESCUED_KEY = "appender_rescued_row_ids"
+
 # ── Country normalisation ─────────────────────────────────────────────────────
 # Maps every known variant (lowercase) → canonical short code.
 # Column headers containing any COUNTRY_COL_HINTS word trigger normalisation.
@@ -806,15 +809,178 @@ def _norm_emaildomain(val) -> str:
     return v
 
 
-def append_lists(df_main, df_new, mapping):
-    # mapping: {main_col: source_col_in_df_new | APPEND_SKIP}
-    new_rows = {}
-    for main_col, source in mapping.items():
-        if source == APPEND_SKIP:
-            new_rows[main_col] = [None] * len(df_new)
-        else:
-            new_rows[main_col] = df_new[source].values
-    return pd.concat([df_main, pd.DataFrame(new_rows)], ignore_index=True)
+def rescue_append_row(main_name: str, row_id: str) -> None:
+    rescued = {k: set(v) for k, v in st.session_state.get(APPEND_RESCUED_KEY, {}).items()}
+    rescued.setdefault(main_name, set()).add(row_id)
+    st.session_state[APPEND_RESCUED_KEY] = rescued
+
+
+def unrescue_append_row(main_name: str, row_id: str) -> None:
+    rescued = {k: set(v) for k, v in st.session_state.get(APPEND_RESCUED_KEY, {}).items()}
+    rescued.setdefault(main_name, set()).discard(row_id)
+    st.session_state[APPEND_RESCUED_KEY] = rescued
+
+
+def compute_append_payload(main_name, main_file, main_sheet, mappings, email_col, new_files, sheets_map, ranges_map):
+    """
+    Map every file's rows onto the main list's columns and flag duplicate emails
+    without dropping anything yet — the caller decides what stays out based on
+    which flagged rows the user has since rescued.
+    Returns {main_name, df_main, mapped_rows, skip_map}.
+    mapped_rows carries two bookkeeping columns, "_row_id" and "_source_file",
+    which the renderer strips before the final concat.
+    skip_map: {row_id: {reason, email, comparison, label, row_num, file}}
+    """
+    main_file.seek(0)
+    df_main = read_file(main_file, sheet_name=main_sheet)
+    main_name_col = detect_company_col(df_main.columns.tolist())
+
+    # email -> display label, seeded from the main list, then extended with
+    # every newly-kept row so later files also dedupe against earlier ones.
+    existing_email_map = {}
+    if email_col and email_col in df_main.columns:
+        for _, r in df_main.dropna(subset=[email_col]).iterrows():
+            key = str(r[email_col]).strip().lower()
+            if key and key not in existing_email_map:
+                label = r.get(main_name_col)
+                existing_email_map[key] = str(label).strip() if pd.notna(label) else key
+
+    mapped_chunks = []
+    skip_map = {}
+
+    for ap_file in new_files:
+        if ap_file.name not in mappings:
+            continue
+        ap_file.seek(0)
+        df_ap_new = read_file(ap_file, sheet_name=sheets_map.get(ap_file.name, 0))
+        file_mapping = mappings[ap_file.name]
+        from_r, to_r = ranges_map.get(ap_file.name, (1, len(df_ap_new)))
+        df_slice = df_ap_new.iloc[from_r - 1:to_r].reset_index(drop=True)
+
+        email_source = file_mapping.get(email_col, APPEND_SKIP) if email_col else APPEND_SKIP
+        name_source  = file_mapping.get(main_name_col, APPEND_SKIP)
+
+        row_ids = [f"{main_name}||{ap_file.name}||{from_r + i}" for i in range(len(df_slice))]
+        mapped_full = pd.DataFrame({
+            mc: (df_slice[src].values if src != APPEND_SKIP and src in df_slice.columns
+                 else [None] * len(df_slice))
+            for mc, src in file_mapping.items()
+        })
+        mapped_full["_row_id"]      = row_ids
+        mapped_full["_source_file"] = ap_file.name
+
+        if email_col and email_source != APPEND_SKIP and email_source in df_slice.columns:
+            seen_in_batch = {}
+            for i in range(len(df_slice)):
+                val = df_slice[email_source].iloc[i]
+                key = str(val).strip().lower() if pd.notna(val) else ""
+                if not key:
+                    continue
+                label = None
+                if name_source != APPEND_SKIP and name_source in df_slice.columns:
+                    nv = df_slice[name_source].iloc[i]
+                    if pd.notna(nv) and str(nv).strip():
+                        label = str(nv).strip()
+                if key in existing_email_map:
+                    skip_map[row_ids[i]] = {
+                        "reason": "existing", "email": val,
+                        "comparison": existing_email_map[key],
+                        "label": label or key, "row_num": from_r + i, "file": ap_file.name,
+                    }
+                elif key in seen_in_batch:
+                    skip_map[row_ids[i]] = {
+                        "reason": "internal", "email": val,
+                        "comparison": seen_in_batch[key],
+                        "label": label or key, "row_num": from_r + i, "file": ap_file.name,
+                    }
+                else:
+                    seen_in_batch[key] = label or key
+            # Fold this file's unique emails into the cross-file map only now —
+            # doing it inline above would make same-file dupes match "existing"
+            # (checked first) instead of "internal" before they're ever compared.
+            existing_email_map.update(seen_in_batch)
+
+        for col in mapped_full.columns:
+            if col in ("_row_id", "_source_file"):
+                continue
+            if _is_website_col(col):
+                mapped_full[col] = mapped_full[col].apply(_norm_website)
+            elif _is_emaildomain_col(col):
+                mapped_full[col] = mapped_full[col].apply(_norm_emaildomain)
+
+        mapped_chunks.append(mapped_full)
+
+    mapped_rows = pd.concat(mapped_chunks, ignore_index=True) if mapped_chunks else pd.DataFrame()
+
+    return {
+        "main_name":   main_name,
+        "df_main":     df_main,
+        "mapped_rows": mapped_rows,
+        "skip_map":    skip_map,
+    }
+
+
+def render_append_payload(payload):
+    """Render one main list's append result, applying the current rescue state,
+    and return the final combined DataFrame for download."""
+    main_name   = payload["main_name"]
+    df_main     = payload["df_main"]
+    mapped_rows = payload["mapped_rows"]
+    skip_map    = payload["skip_map"]
+
+    rescued         = st.session_state.get(APPEND_RESCUED_KEY, {}).get(main_name, set())
+    active_skip_ids = {rid for rid in skip_map if rid not in rescued}
+
+    if len(mapped_rows):
+        keep_mask = ~mapped_rows["_row_id"].isin(active_skip_ids)
+        kept_rows = mapped_rows[keep_mask].drop(columns=["_row_id", "_source_file"]).reset_index(drop=True)
+    else:
+        kept_rows = mapped_rows
+
+    df_result     = pd.concat([df_main, kept_rows], ignore_index=True) if len(kept_rows) else df_main.copy()
+    original_rows = len(df_main)
+    appended_rows = len(kept_rows)
+    skipped_count = len(active_skip_ids)
+
+    st.markdown(f'<div class="section-header">&#9632;&nbsp; Result — {main_name}</div>', unsafe_allow_html=True)
+    stat_cols = st.columns(4 if skip_map else 3, gap="small")
+    stat_cols[0].markdown(f'<div class="stat-box"><div class="stat-num">{original_rows:,}</div><div class="stat-label">Main rows</div></div>', unsafe_allow_html=True)
+    stat_cols[1].markdown(f'<div class="stat-box"><div class="stat-num">{appended_rows:,}</div><div class="stat-label">Appended rows</div></div>', unsafe_allow_html=True)
+    if skip_map:
+        stat_cols[2].markdown(f'<div class="stat-box"><div class="stat-num warn">{skipped_count:,}</div><div class="stat-label">Skipped (email)</div></div>', unsafe_allow_html=True)
+    stat_cols[-1].markdown(f'<div class="stat-box"><div class="stat-num">{len(df_result):,}</div><div class="stat-label">Total rows</div></div>', unsafe_allow_html=True)
+
+    st.markdown("")
+    st.dataframe(kept_rows.head(200), use_container_width=True, hide_index=True)
+    if len(kept_rows) > 200:
+        st.markdown(f"<small style='color:#3a4a5e'>Showing first 200 of {len(kept_rows):,} new rows.</small>", unsafe_allow_html=True)
+
+    if skip_map:
+        st.markdown("")
+        st.markdown('<div class="section-header">&#9664;&#9654;&nbsp; Skipped rows (duplicate email)</div>', unsafe_allow_html=True)
+        st.markdown("<small style='color:#3a4a5e'>These rows were left out because their email already exists. Click <strong>Include anyway</strong> if it's not actually a duplicate.</small>", unsafe_allow_html=True)
+        st.markdown("")
+        for rid, info in sorted(skip_map.items(), key=lambda kv: kv[1]["row_num"]):
+            is_rescued = rid in rescued
+            row_l, row_r = st.columns([0.82, 0.18])
+            reason_txt = "already in main list" if info["reason"] == "existing" else "duplicate within this file"
+            with row_l:
+                st.markdown(f"""
+                <div class="match-card" style="{'opacity:0.45' if is_rescued else ''}">
+                  <span class="match-names"><span class="match-main">{info['label']}</span><span class="match-arrow"> {reason_txt} &mdash; </span>{info['comparison']} <span style="color:var(--tx-lo)">({info['email']})</span></span>
+                  <span class="match-score">{info['file']} &middot; row {info['row_num']}</span>
+                </div>""", unsafe_allow_html=True)
+            with row_r:
+                if is_rescued:
+                    if st.button("Remove", key=f"unrescue_ap_{main_name}_{rid}", type="secondary"):
+                        unrescue_append_row(main_name, rid)
+                        st.rerun()
+                else:
+                    if st.button("Include anyway", key=f"rescue_ap_{main_name}_{rid}", type="secondary"):
+                        rescue_append_row(main_name, rid)
+                        st.rerun()
+
+    return df_result
 
 
 # ── UI ────────────────────────────────────────────────────────────────────────
@@ -1350,103 +1516,55 @@ with tab2:
             st.error("Column mapping could not be determined. Check your files.")
         else:
             try:
-                def _do_append(main_file, main_sheet, mappings, email_col):
-                    main_file.seek(0)
-                    df_result = read_file(main_file, sheet_name=main_sheet)
-                    original_rows  = len(df_result)
-                    total_appended = 0
-                    total_skipped  = 0
-                    for ap_file in ap_new_files:
-                        if ap_file.name not in mappings:
-                            continue
-                        with st.spinner(f"Merging {ap_file.name} → {main_file.name}…"):
-                            ap_file.seek(0)
-                            df_ap_new    = read_file(ap_file, sheet_name=ap_sheets.get(ap_file.name, 0))
-                            file_mapping = mappings[ap_file.name]
-
-                            _from_r, _to_r = ap_ranges.get(ap_file.name, (1, len(df_ap_new)))
-                            df_ap_new = df_ap_new.iloc[_from_r - 1:_to_r].reset_index(drop=True)
-
-                            if email_col and email_col in df_result.columns:
-                                email_source = file_mapping.get(email_col, APPEND_SKIP)
-                                if email_source != APPEND_SKIP and email_source in df_ap_new.columns:
-                                    existing_emails = set(
-                                        df_result[email_col].dropna().astype(str).str.lower().str.strip()
-                                    )
-                                    mask = ~df_ap_new[email_source].astype(str).str.lower().str.strip().isin(existing_emails)
-                                    total_skipped += (~mask).sum()
-                                    df_ap_new = df_ap_new[mask].reset_index(drop=True)
-                                    before_internal = len(df_ap_new)
-                                    df_ap_new = df_ap_new.drop_duplicates(subset=[email_source], keep='first').reset_index(drop=True)
-                                    total_skipped += before_internal - len(df_ap_new)
-
-                            rows_before = len(df_result)
-                            df_result = append_lists(df_result, df_ap_new, file_mapping)
-                            for _col in df_result.columns:
-                                if _is_website_col(_col):
-                                    df_result.loc[rows_before:, _col] = (
-                                        df_result.loc[rows_before:, _col].apply(_norm_website)
-                                    )
-                                elif _is_emaildomain_col(_col):
-                                    df_result.loc[rows_before:, _col] = (
-                                        df_result.loc[rows_before:, _col].apply(_norm_emaildomain)
-                                    )
-                            total_appended += len(df_result) - rows_before
-                    return df_result, original_rows, total_appended, total_skipped
-
-                _runs = [(ap_main_file_1, ap_main_sheet_1, ap_mappings_1, ap_email_col_1)]
+                _runs = [(ap_main_file_1.name, ap_main_file_1, ap_main_sheet_1, ap_mappings_1, ap_email_col_1)]
                 if ap_main_file_2 and ap_mappings_2:
-                    _runs.append((ap_main_file_2, ap_main_sheet_2, ap_mappings_2, ap_email_col_2))
+                    _runs.append((ap_main_file_2.name, ap_main_file_2, ap_main_sheet_2, ap_mappings_2, ap_email_col_2))
 
-                _results = []
-                for _mf, _ms, _maps, _ecol in _runs:
-                    with st.spinner(f"Reading {_mf.name}…"):
-                        _df_res, _orig_rows, _appended, _skipped = _do_append(_mf, _ms, _maps, _ecol)
-                    _results.append((_mf.name, _df_res, _orig_rows, _appended, _skipped))
-
-                for _src_name, _df_res, _orig_rows, _appended, _skipped in _results:
-                    st.markdown(f'<div class="section-header">&#9632;&nbsp; Result — {_src_name}</div>', unsafe_allow_html=True)
-                    _stat_cols = st.columns(4 if _skipped else 3, gap="small")
-                    _stat_cols[0].markdown(f'<div class="stat-box"><div class="stat-num">{_orig_rows:,}</div><div class="stat-label">Main rows</div></div>', unsafe_allow_html=True)
-                    _stat_cols[1].markdown(f'<div class="stat-box"><div class="stat-num">{_appended:,}</div><div class="stat-label">Appended rows</div></div>', unsafe_allow_html=True)
-                    if _skipped:
-                        _stat_cols[2].markdown(f'<div class="stat-box"><div class="stat-num warn">{_skipped:,}</div><div class="stat-label">Skipped (email)</div></div>', unsafe_allow_html=True)
-                    _stat_cols[-1].markdown(f'<div class="stat-box"><div class="stat-num">{len(_df_res):,}</div><div class="stat-label">Total rows</div></div>', unsafe_allow_html=True)
-
-                    st.markdown("")
-                    _df_new_rows = _df_res.iloc[_orig_rows:].reset_index(drop=True)
-                    st.dataframe(_df_new_rows.head(200), use_container_width=True, hide_index=True)
-                    if len(_df_new_rows) > 200:
-                        st.markdown(f"<small style='color:#3a4a5e'>Showing first 200 of {len(_df_new_rows):,} new rows.</small>", unsafe_allow_html=True)
-                    st.markdown("")
-
-                # ── Serialise download data into session state ─────────────────
-                if len(_results) == 1:
-                    _sn, _df = _results[0][0], _results[0][1]
-                    st.session_state["ap_dl"] = {
-                        "data":  _df.to_csv(index=False).encode("utf-8-sig"),
-                        "name":  _output_filename(_sn, ".csv"),
-                        "mime":  "text/csv",
-                        "label": "&#11015;  Download CSV",
-                    }
-                else:
-                    _zip_buf = io.BytesIO()
-                    with zipfile.ZipFile(_zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as _zf:
-                        for _sn, _df, _, _, _ in _results:
-                            _zf.writestr(
-                                _output_filename(_sn, ".csv"),
-                                _df.to_csv(index=False).encode("utf-8-sig"),
-                            )
-                    st.session_state["ap_dl"] = {
-                        "data":  _zip_buf.getvalue(),
-                        "name":  "appended_lists.zip",
-                        "mime":  "application/zip",
-                        "label": "&#11015;  Download all (ZIP)",
-                    }
+                _payloads = []
+                for _name, _mf, _ms, _maps, _ecol in _runs:
+                    with st.spinner(f"Merging into {_name}…"):
+                        _payloads.append(
+                            compute_append_payload(_name, _mf, _ms, _maps, _ecol, ap_new_files, ap_sheets, ap_ranges)
+                        )
+                st.session_state[APPEND_RESULTS_KEY] = _payloads
+                st.session_state[APPEND_RESCUED_KEY] = {}
 
             except Exception as e:
                 st.error(f"Something went wrong: {e}")
                 st.exception(e)
+
+    _append_payloads = st.session_state.get(APPEND_RESULTS_KEY)
+
+    if _append_payloads:
+        _results = []
+        for _payload in _append_payloads:
+            _df_res = render_append_payload(_payload)
+            _results.append((_payload["main_name"], _df_res))
+            st.markdown("")
+
+        # ── Serialise download data into session state ─────────────────
+        if len(_results) == 1:
+            _sn, _df = _results[0]
+            st.session_state["ap_dl"] = {
+                "data":  _df.to_csv(index=False).encode("utf-8-sig"),
+                "name":  _output_filename(_sn, ".csv"),
+                "mime":  "text/csv",
+                "label": "&#11015;  Download CSV",
+            }
+        else:
+            _zip_buf = io.BytesIO()
+            with zipfile.ZipFile(_zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as _zf:
+                for _sn, _df in _results:
+                    _zf.writestr(
+                        _output_filename(_sn, ".csv"),
+                        _df.to_csv(index=False).encode("utf-8-sig"),
+                    )
+            st.session_state["ap_dl"] = {
+                "data":  _zip_buf.getvalue(),
+                "name":  "appended_lists.zip",
+                "mime":  "application/zip",
+                "label": "&#11015;  Download all (ZIP)",
+            }
 
     if st.session_state.get("ap_dl"):
         _dl = st.session_state["ap_dl"]
