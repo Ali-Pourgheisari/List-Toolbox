@@ -609,11 +609,17 @@ def detect_company_col(columns) -> str:
 def _unwrap_double_encoded_csv(text):
     """Some exports wrap every row in an extra layer of CSV quoting, so each
     row parses as a single field whose content is itself a full CSV row.
-    Detect that pattern and strip the outer layer."""
+    Detect that pattern, strip the outer layer, and return the rows already
+    split into fields (as a list of lists) rather than reassembled text:
+    the leading field of the inner row is sometimes left unquoted even when
+    it contains a literal comma, which a second blind CSV parse can't tell
+    apart from an actual column boundary. Any such stray split is merged
+    back into the leading field using the header's column count as the
+    source of truth."""
     lines = [ln for ln in text.splitlines() if ln.strip()]
     if len(lines) < 2:
         return None
-    unwrapped = []
+    outer = []
     for ln in lines:
         try:
             fields = next(csv.reader([ln]))
@@ -621,10 +627,15 @@ def _unwrap_double_encoded_csv(text):
             return None
         if len(fields) != 1:
             return None
-        unwrapped.append(fields[0])
-    if not any(re.search(r'[,;]', u) for u in unwrapped[:5]):
+        outer.append(fields[0])
+    if not any(re.search(r'[,;]', u) for u in outer[:5]):
         return None
-    return '\n'.join(unwrapped)
+    rows = [next(csv.reader([u])) for u in outer]
+    n_cols = len(rows[0])
+    for row in rows[1:]:
+        while len(row) > n_cols:
+            row[0:2] = [row[0] + ',' + row[1]]
+    return rows
 
 def read_file(f, nrows=None, sheet_name=0):
     raw = f.read()
@@ -638,7 +649,12 @@ def read_file(f, nrows=None, sheet_name=0):
                 pass
         if text is None:
             text = raw.decode('latin-1', errors='replace')
-        text = _unwrap_double_encoded_csv(text) or text
+        rows = _unwrap_double_encoded_csv(text)
+        if rows is not None:
+            df = pd.DataFrame(rows[1:], columns=rows[0])
+            if nrows is not None:
+                df = df.head(nrows)
+            return normalize_country_cols(df)
         try:
             sep = csv.Sniffer().sniff(text[:4096], delimiters=',;').delimiter
         except csv.Error:
