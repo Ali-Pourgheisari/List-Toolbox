@@ -606,20 +606,44 @@ def detect_company_col(columns) -> str:
             return col
     return columns[0]
 
+def _unwrap_double_encoded_csv(text):
+    """Some exports wrap every row in an extra layer of CSV quoting, so each
+    row parses as a single field whose content is itself a full CSV row.
+    Detect that pattern and strip the outer layer."""
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if len(lines) < 2:
+        return None
+    unwrapped = []
+    for ln in lines:
+        try:
+            fields = next(csv.reader([ln]))
+        except csv.Error:
+            return None
+        if len(fields) != 1:
+            return None
+        unwrapped.append(fields[0])
+    if not any(re.search(r'[,;]', u) for u in unwrapped[:5]):
+        return None
+    return '\n'.join(unwrapped)
+
 def read_file(f, nrows=None, sheet_name=0):
     raw = f.read()
     if f.name.lower().endswith('.csv'):
-        sample = raw[:4096].decode('utf-8', errors='replace')
-        try:
-            sep = csv.Sniffer().sniff(sample, delimiters=',;').delimiter
-        except csv.Error:
-            sep = ','
+        text = None
         for encoding in ('utf-8-sig', 'utf-8', 'cp1252', 'latin-1'):
             try:
-                return normalize_country_cols(pd.read_csv(io.BytesIO(raw), sep=sep, nrows=nrows, encoding=encoding))
+                text = raw.decode(encoding)
+                break
             except (UnicodeDecodeError, LookupError):
                 pass
-        return normalize_country_cols(pd.read_csv(io.BytesIO(raw), sep=sep, nrows=nrows, encoding='latin-1', encoding_errors='replace'))
+        if text is None:
+            text = raw.decode('latin-1', errors='replace')
+        text = _unwrap_double_encoded_csv(text) or text
+        try:
+            sep = csv.Sniffer().sniff(text[:4096], delimiters=',;').delimiter
+        except csv.Error:
+            sep = ','
+        return normalize_country_cols(pd.read_csv(io.StringIO(text), sep=sep, nrows=nrows))
     return normalize_country_cols(pd.read_excel(io.BytesIO(raw), nrows=nrows, sheet_name=sheet_name))
 
 
