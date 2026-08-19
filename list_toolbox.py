@@ -694,6 +694,38 @@ def find_internal_duplicates(names: list, threshold: int) -> list:
     return duplicates
 
 
+def find_symmetric_overlap(names_a: list, names_b: list, threshold: int) -> tuple:
+    """
+    Cross-compare two lists. Any pair scoring >= threshold is treated as the same
+    entity and dropped from BOTH sides (not just flagged on one side).
+    Returns (keep_a, keep_b, overlaps) where keep_a/keep_b are indices with no
+    match on the other side, and overlaps is [{id_a, id_b, name_a, name_b, score}].
+    """
+    norm_a = [normalize(n) for n in names_a]
+    norm_b = [normalize(n) for n in names_b]
+    matched_a: set = set()
+    matched_b: set = set()
+    overlaps = []
+
+    for j, norm_bj in enumerate(norm_b):
+        if not norm_bj:
+            continue
+        result = process.extractOne(norm_bj, norm_a, scorer=fuzz.token_sort_ratio)
+        if result and result[1] >= threshold:
+            i = result[2]
+            matched_a.add(i)
+            matched_b.add(j)
+            overlaps.append({
+                "id_a": i, "id_b": j,
+                "name_a": names_a[i], "name_b": names_b[j],
+                "score": result[1],
+            })
+
+    keep_a = [i for i in range(len(names_a)) if i not in matched_a]
+    keep_b = [j for j in range(len(names_b)) if j not in matched_b]
+    return keep_a, keep_b, overlaps
+
+
 def store_results(payload: dict) -> None:
     previous_payload = st.session_state.get(RESULTS_SESSION_KEY)
     previous_moved = list(st.session_state.get(MOVED_SESSION_KEY, []))
@@ -811,14 +843,14 @@ with _hcol_btn:
 
 st.markdown("<div style='margin-bottom:0.2rem'></div>", unsafe_allow_html=True)
 
-tab1, tab2 = st.tabs(["  List Screener  ", "  List Appender  "])
+tab1, tab2, tab3 = st.tabs(["  Unique Rows Finder  ", "  List Appender  ", "  List Diff  "])
 
-# ── Tab 1: List Screener ───────────────────────────────────────────────────────
+# ── Tab 1: Unique Rows Finder ───────────────────────────────────────────────────
 with tab1:
 
     st.markdown("""
 <div class="tab-desc">
-  <strong>List Screener</strong> — upload your main database and a new list, then
+  <strong>Unique Rows Finder</strong> — upload your main database and a new list, then
   run a fuzzy company-name match to flag entries that already exist. Move confirmed
   matches out, keep clean records in.
 </div>""", unsafe_allow_html=True)
@@ -1317,6 +1349,270 @@ with tab2:
         <div style='background:linear-gradient(135deg,#0d1117,#0c1520);border:1px dashed #1e2d3d;border-radius:10px;padding:2.5rem;text-align:center;margin-top:1rem'>
           <div style='font-family:JetBrains Mono,monospace;font-size:2rem;color:#1a2d3e;margin-bottom:0.8rem'>&#9632;</div>
           <div style='color:#3a4a5e;font-size:0.9rem'>Upload your main list and one or more files to append, then hit <strong style="color:#00ff8866">Append Lists</strong>.</div>
+          <div style='color:#1e2d3d;font-size:0.78rem;margin-top:0.5rem'>Supports .xlsx, .xls, and .csv</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+# ── Tab 3: List Diff ─────────────────────────────────────────────────────────────
+with tab3:
+
+    st.markdown("""
+<div class="tab-desc">
+  <strong>List Diff</strong> — merge several secondary lists together and dedup them,
+  then compare the result against your main list. Any entry found in <em>both</em> is
+  redundant and gets removed from both sides — what's left is only in the main list,
+  or only in the secondary lists, never both.
+</div>""", unsafe_allow_html=True)
+
+    # ── Upload ─────────────────────────────────────────────────────────────────
+    ld_col_a, ld_col_b = st.columns(2, gap="medium")
+
+    with ld_col_a:
+        st.markdown('<div class="upload-label">&#9632;&nbsp; 01 &mdash; Main list</div>', unsafe_allow_html=True)
+        ld_main_file = st.file_uploader("Main list", type=["xlsx", "xls", "csv"], key="ld_main",
+                                         label_visibility="collapsed")
+
+    with ld_col_b:
+        st.markdown('<div class="upload-label">&#9632;&nbsp; 02 &mdash; Secondary lists</div>', unsafe_allow_html=True)
+        ld_secondary_files = st.file_uploader("Secondary lists", type=["xlsx", "xls", "csv"], key="ld_secondary",
+                                               accept_multiple_files=True, label_visibility="collapsed")
+
+    st.markdown("")
+
+    # ── Sheet selection (main, Excel only) ──────────────────────────────────────
+    ld_main_sheet = 0
+    if ld_main_file and not ld_main_file.name.lower().endswith('.csv'):
+        _lds = get_excel_sheets(ld_main_file)
+        if _lds:
+            ld_main_sheet = st.selectbox("Sheet — Main list", _lds, key="ld_main_sheet")
+            st.markdown("")
+
+    # ── Column selection ────────────────────────────────────────────────────────
+    ld_main_col_choice = None
+    ld_sec_cols   = {}   # {filename: compare_col}
+    ld_sec_sheets = {}   # {filename: sheet_name}
+
+    if ld_main_file and ld_secondary_files:
+        try:
+            ld_main_cols = read_file(ld_main_file, nrows=0, sheet_name=ld_main_sheet).columns.tolist()
+            ld_main_file.seek(0)
+        except Exception:
+            ld_main_cols = []
+
+        if ld_main_cols:
+            st.markdown('<div class="section-header">&#9632;&nbsp; 03 &mdash; Column to compare</div>', unsafe_allow_html=True)
+            default_ld_main = detect_company_col(ld_main_cols)
+            ld_main_col_choice = st.selectbox(
+                "Main list — company column",
+                ld_main_cols,
+                index=ld_main_cols.index(default_ld_main),
+            )
+            st.markdown("")
+            st.markdown("<small style='color:#3a4a5e'>Pick the matching column in each secondary file &mdash; they don't need the same header name.</small>", unsafe_allow_html=True)
+            st.markdown("")
+
+            for ld_file in ld_secondary_files:
+                with st.expander(f"**{ld_file.name}**", expanded=True):
+                    _ld_sheet = 0
+                    if not ld_file.name.lower().endswith('.csv'):
+                        _ld_file_sheets = get_excel_sheets(ld_file)
+                        if _ld_file_sheets:
+                            _ld_sheet = st.selectbox(
+                                "Sheet to use",
+                                _ld_file_sheets,
+                                key=f"ld_sheet_{ld_file.name}",
+                            )
+                            st.markdown("")
+                    ld_sec_sheets[ld_file.name] = _ld_sheet
+
+                    try:
+                        ld_cols_preview = read_file(ld_file, nrows=0, sheet_name=_ld_sheet).columns.tolist()
+                        ld_file.seek(0)
+                    except Exception:
+                        st.warning(f"Could not read columns from {ld_file.name}.")
+                        continue
+
+                    default_ld_sec = detect_company_col(ld_cols_preview)
+                    ld_sec_cols[ld_file.name] = st.selectbox(
+                        "Company column in this file",
+                        ld_cols_preview,
+                        index=ld_cols_preview.index(default_ld_sec),
+                        key=f"ld_col_{ld_file.name}",
+                    )
+
+            st.markdown("")
+
+    st.markdown('<div class="section-header">&#9632;&nbsp; 04 &mdash; Match sensitivity</div>', unsafe_allow_html=True)
+
+    ld_thresh_col, ld_hint_col = st.columns([3, 1])
+    with ld_thresh_col:
+        ld_threshold = st.slider(
+            "Match threshold",
+            min_value=50, max_value=100, value=70,
+            help="Lower = catches more variations. 70 is a good default.",
+            label_visibility="collapsed",
+            key="ld_threshold",
+        )
+    with ld_hint_col:
+        st.markdown(f"<div style='font-family:JetBrains Mono,monospace;font-size:1.4rem;font-weight:700;color:#00ff88;text-align:center;padding-top:0.3rem'>{ld_threshold}<span style='font-size:0.7rem;color:#3a4a5e;margin-left:2px'>/ 100</span></div>", unsafe_allow_html=True)
+
+    st.markdown(f"<small style='color:#2a3a4e'>Entries scoring &ge; {ld_threshold} against each other are treated as the same company and dropped from both lists.</small>", unsafe_allow_html=True)
+    st.markdown("")
+
+    ld_run = st.button("&#9889;  Run List Diff", type="primary", use_container_width=True)
+
+    if ld_run:
+        if not ld_main_file or not ld_secondary_files:
+            st.error("Please upload the main list and at least one secondary list.")
+        elif not ld_sec_cols:
+            st.error("Column selection could not be determined. Check your files.")
+        else:
+            try:
+                with st.spinner("Reading files…"):
+                    df_main_ld = read_file(ld_main_file, sheet_name=ld_main_sheet)
+
+                main_col_ld = ld_main_col_choice or detect_company_col(df_main_ld.columns.tolist())
+                df_main_valid = df_main_ld.dropna(subset=[main_col_ld]).reset_index(drop=True)
+                main_values = df_main_valid[main_col_ld].astype(str).tolist()
+
+                with st.spinner("Merging secondary lists…"):
+                    sec_frames = []
+                    for ld_file in ld_secondary_files:
+                        if ld_file.name not in ld_sec_cols:
+                            continue
+                        df_sec = read_file(ld_file, sheet_name=ld_sec_sheets.get(ld_file.name, 0))
+                        sec_col = ld_sec_cols[ld_file.name]
+                        df_sec = df_sec.dropna(subset=[sec_col]).reset_index(drop=True)
+                        df_sec["__ld_compare__"] = df_sec[sec_col].astype(str)
+                        sec_frames.append(df_sec)
+
+                if not sec_frames:
+                    st.error("Could not read any of the secondary files.")
+                else:
+                    df_sec_merged = pd.concat(sec_frames, ignore_index=True, sort=False)
+                    sec_values = df_sec_merged["__ld_compare__"].tolist()
+
+                    with st.spinner("Deduping secondary lists…"):
+                        internal_dups_ld = find_internal_duplicates(sec_values, ld_threshold)
+                        dup_ids_ld = {d["id_dup"] for d in internal_dups_ld}
+                        dedup_idx = [i for i in range(len(sec_values)) if i not in dup_ids_ld]
+                        df_sec_deduped = df_sec_merged.iloc[dedup_idx].reset_index(drop=True)
+                        sec_values_deduped = df_sec_deduped["__ld_compare__"].tolist()
+
+                    with st.spinner("Comparing against main list…"):
+                        keep_main_idx, keep_sec_idx, overlaps = find_symmetric_overlap(
+                            main_values, sec_values_deduped, ld_threshold
+                        )
+
+                    df_main_result = df_main_valid.iloc[keep_main_idx].copy()
+                    df_main_result.insert(0, "Source", "Main")
+
+                    df_sec_result = df_sec_deduped.iloc[keep_sec_idx].drop(columns=["__ld_compare__"]).copy()
+                    df_sec_result.insert(0, "Source", "Secondary")
+
+                    df_diff_result = pd.concat([df_main_result, df_sec_result], ignore_index=True, sort=False)
+
+                    st.session_state["ld_result"] = {
+                        "df": df_diff_result,
+                        "main_count": len(main_values),
+                        "sec_count": len(sec_values),
+                        "internal_dups": internal_dups_ld,
+                        "overlaps": overlaps,
+                        "main_file_name": getattr(ld_main_file, "name", "list_diff"),
+                    }
+
+            except Exception as e:
+                st.error(f"Something went wrong: {e}")
+                st.exception(e)
+
+    ld_result = st.session_state.get("ld_result")
+
+    if ld_result:
+        df_diff_result = ld_result["df"]
+
+        st.markdown('<div class="section-header">&#9632;&nbsp; Result</div>', unsafe_allow_html=True)
+
+        ld_s1, ld_s2, ld_s3, ld_s4, ld_s5 = st.columns(5, gap="small")
+        with ld_s1:
+            st.markdown(f'<div class="stat-box"><div class="stat-num">{ld_result["main_count"]:,}</div><div class="stat-label">Main rows</div></div>', unsafe_allow_html=True)
+        with ld_s2:
+            st.markdown(f'<div class="stat-box"><div class="stat-num">{ld_result["sec_count"]:,}</div><div class="stat-label">Secondary rows (merged)</div></div>', unsafe_allow_html=True)
+        with ld_s3:
+            st.markdown(f'<div class="stat-box"><div class="stat-num warn">{len(ld_result["internal_dups"]):,}</div><div class="stat-label">Secondary dups removed</div></div>', unsafe_allow_html=True)
+        with ld_s4:
+            st.markdown(f'<div class="stat-box"><div class="stat-num warn">{len(ld_result["overlaps"]):,}</div><div class="stat-label">Redundant pairs removed</div></div>', unsafe_allow_html=True)
+        with ld_s5:
+            st.markdown(f'<div class="stat-box"><div class="stat-num">{len(df_diff_result):,}</div><div class="stat-label">Unique rows</div></div>', unsafe_allow_html=True)
+
+        st.markdown("")
+        st.dataframe(df_diff_result.head(200), use_container_width=True, hide_index=True)
+        if len(df_diff_result) > 200:
+            st.markdown(f"<small style='color:#3a4a5e'>Showing first 200 of {len(df_diff_result):,} rows.</small>", unsafe_allow_html=True)
+
+        st.markdown("")
+        ld_dl_a, ld_dl_b = st.columns(2, gap="small")
+        ld_csv = df_diff_result.to_csv(index=False).encode("utf-8-sig")
+        _ld_stem = ld_result["main_file_name"]
+        for _e in ('.xlsx', '.xls', '.csv'):
+            if _ld_stem.lower().endswith(_e):
+                _ld_stem = _ld_stem[:-len(_e)]
+                break
+        _ld_filename_base = f"{_ld_stem}_list_diff"
+        with ld_dl_a:
+            st.download_button(
+                label="&#11015;  Download CSV",
+                data=ld_csv,
+                file_name=_output_filename(_ld_filename_base, ".csv"),
+                mime="text/csv",
+                use_container_width=True,
+            )
+        with ld_dl_b:
+            ld_excel_buf = io.BytesIO()
+            with pd.ExcelWriter(ld_excel_buf, engine="openpyxl") as writer:
+                df_diff_result.to_excel(writer, index=False, sheet_name="List Diff")
+            st.download_button(
+                label="&#11015;  Download Excel",
+                data=ld_excel_buf.getvalue(),
+                file_name=_output_filename(_ld_filename_base, ".xlsx"),
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+
+        if ld_result["internal_dups"]:
+            st.markdown("")
+            st.markdown('<div class="section-header">&#9664;&#9654;&nbsp; Duplicates merged within the secondary lists</div>', unsafe_allow_html=True)
+            for dup in sorted(ld_result["internal_dups"], key=lambda d: -d["score"]):
+                score_class = "high" if dup["score"] >= 90 else ""
+                st.markdown(f"""
+                <div class="match-card">
+                  <span class="match-names">
+                    <span class="match-main">{dup["name_keeper"]}</span>
+                    <span class="match-arrow"> &lArr; dup &mdash; </span>
+                    {dup["name_dup"]}
+                  </span>
+                  <span class="match-score {score_class}">{dup["score"]}%</span>
+                </div>""", unsafe_allow_html=True)
+
+        if ld_result["overlaps"]:
+            st.markdown("")
+            st.markdown('<div class="section-header">&#8635;&nbsp; Redundant entries removed from both lists</div>', unsafe_allow_html=True)
+            for ov in sorted(ld_result["overlaps"], key=lambda d: -d["score"]):
+                score_class = "high" if ov["score"] >= 90 else ""
+                st.markdown(f"""
+                <div class="match-card">
+                  <span class="match-names">
+                    <span class="match-main">{ov["name_a"]}</span>
+                    <span class="match-arrow"> &harr; </span>
+                    {ov["name_b"]}
+                  </span>
+                  <span class="match-score {score_class}">{ov["score"]}%</span>
+                </div>""", unsafe_allow_html=True)
+
+    elif not (ld_main_file and ld_secondary_files):
+        st.markdown("""
+        <div style='background:linear-gradient(135deg,#0d1117,#0c1520);border:1px dashed #1e2d3d;border-radius:10px;padding:2.5rem;text-align:center;margin-top:1rem'>
+          <div style='font-family:JetBrains Mono,monospace;font-size:2rem;color:#1a2d3e;margin-bottom:0.8rem'>&#9632;</div>
+          <div style='color:#3a4a5e;font-size:0.9rem'>Upload your main list and two or more secondary lists, then hit <strong style="color:#00ff8866">Run List Diff</strong>.</div>
           <div style='color:#1e2d3d;font-size:0.78rem;margin-top:0.5rem'>Supports .xlsx, .xls, and .csv</div>
         </div>
         """, unsafe_allow_html=True)
