@@ -1670,10 +1670,10 @@ with tab3:
 
     st.markdown("""
 <div class="tab-desc">
-  <strong>List Diff</strong> — merge several secondary lists together and dedup them,
-  then compare the result against your main list. Any entry found in <em>both</em> is
-  redundant and gets removed from both sides — what's left is only in the main list,
-  or only in the secondary lists, never both.
+  <strong>List Diff</strong> — merge several secondary lists together, then compare the
+  result against your main list. Any entry found in <em>both</em> is redundant and gets
+  removed from both sides — what's left is only in the main list, or only in the
+  secondary lists, never both.
 </div>""", unsafe_allow_html=True)
 
     # ── Upload ─────────────────────────────────────────────────────────────────
@@ -1804,22 +1804,15 @@ with tab3:
                     df_sec_merged = pd.concat(sec_frames, ignore_index=True, sort=False)
                     sec_values = df_sec_merged["__ld_compare__"].tolist()
 
-                    with st.spinner("Deduping secondary lists…"):
-                        internal_dups_ld = find_internal_duplicates(sec_values, ld_threshold)
-                        dup_ids_ld = {d["id_dup"] for d in internal_dups_ld}
-                        dedup_idx = [i for i in range(len(sec_values)) if i not in dup_ids_ld]
-                        df_sec_deduped = df_sec_merged.iloc[dedup_idx].reset_index(drop=True)
-                        sec_values_deduped = df_sec_deduped["__ld_compare__"].tolist()
-
                     with st.spinner("Comparing against main list…"):
                         keep_main_idx, keep_sec_idx, overlaps = find_symmetric_overlap(
-                            main_values, sec_values_deduped, ld_threshold
+                            main_values, sec_values, ld_threshold
                         )
 
                     df_main_result = df_main_valid.iloc[keep_main_idx].copy()
                     df_main_result.insert(0, "Source", "Main")
 
-                    df_sec_result = df_sec_deduped.iloc[keep_sec_idx].drop(columns=["__ld_compare__"]).copy()
+                    df_sec_result = df_sec_merged.iloc[keep_sec_idx].drop(columns=["__ld_compare__"]).copy()
                     df_sec_result.insert(0, "Source", "Secondary")
 
                     df_diff_result = pd.concat([df_main_result, df_sec_result], ignore_index=True, sort=False)
@@ -1828,7 +1821,6 @@ with tab3:
                         "df": df_diff_result,
                         "main_count": len(main_values),
                         "sec_count": len(sec_values),
-                        "internal_dups": internal_dups_ld,
                         "overlaps": overlaps,
                         "main_file_name": getattr(ld_main_file, "name", "list_diff"),
                     }
@@ -1844,16 +1836,14 @@ with tab3:
 
         st.markdown('<div class="section-header">&#9632;&nbsp; Result</div>', unsafe_allow_html=True)
 
-        ld_s1, ld_s2, ld_s3, ld_s4, ld_s5 = st.columns(5, gap="small")
+        ld_s1, ld_s2, ld_s3, ld_s4 = st.columns(4, gap="small")
         with ld_s1:
             st.markdown(f'<div class="stat-box"><div class="stat-num">{ld_result["main_count"]:,}</div><div class="stat-label">Main rows</div></div>', unsafe_allow_html=True)
         with ld_s2:
             st.markdown(f'<div class="stat-box"><div class="stat-num">{ld_result["sec_count"]:,}</div><div class="stat-label">Secondary rows (merged)</div></div>', unsafe_allow_html=True)
         with ld_s3:
-            st.markdown(f'<div class="stat-box"><div class="stat-num warn">{len(ld_result["internal_dups"]):,}</div><div class="stat-label">Secondary dups removed</div></div>', unsafe_allow_html=True)
-        with ld_s4:
             st.markdown(f'<div class="stat-box"><div class="stat-num warn">{len(ld_result["overlaps"]):,}</div><div class="stat-label">Redundant pairs removed</div></div>', unsafe_allow_html=True)
-        with ld_s5:
+        with ld_s4:
             st.markdown(f'<div class="stat-box"><div class="stat-num">{len(df_diff_result):,}</div><div class="stat-label">Unique rows</div></div>', unsafe_allow_html=True)
 
         st.markdown("")
@@ -1889,21 +1879,6 @@ with tab3:
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
             )
-
-        if ld_result["internal_dups"]:
-            st.markdown("")
-            st.markdown('<div class="section-header">&#9664;&#9654;&nbsp; Duplicates merged within the secondary lists</div>', unsafe_allow_html=True)
-            for dup in sorted(ld_result["internal_dups"], key=lambda d: -d["score"]):
-                score_class = "high" if dup["score"] >= 90 else ""
-                st.markdown(f"""
-                <div class="match-card">
-                  <span class="match-names">
-                    <span class="match-main">{dup["name_keeper"]}</span>
-                    <span class="match-arrow"> &lArr; dup &mdash; </span>
-                    {dup["name_dup"]}
-                  </span>
-                  <span class="match-score {score_class}">{dup["score"]}%</span>
-                </div>""", unsafe_allow_html=True)
 
         if ld_result["overlaps"]:
             st.markdown("")
