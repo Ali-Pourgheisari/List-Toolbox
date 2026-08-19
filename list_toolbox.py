@@ -3,6 +3,7 @@ import pandas as pd
 import re
 import io
 import csv
+import zipfile
 from datetime import date
 from rapidfuzz import fuzz, process
 
@@ -368,7 +369,11 @@ SUFFIXES = re.compile(
 )
 
 RESULTS_SESSION_KEY = "screener_results"
-MOVED_SESSION_KEY = "screener_moved_match_ids"
+MOVED_SESSION_KEY   = "screener_moved_match_ids"
+DUP_RESCUED_KEY     = "screener_rescued_dup_ids"
+
+APPEND_RESULTS_KEY = "appender_results"
+APPEND_RESCUED_KEY = "appender_rescued_row_ids"
 
 # ── Country normalisation ─────────────────────────────────────────────────────
 # Maps every known variant (lowercase) → canonical short code.
@@ -551,21 +556,16 @@ def normalize_country_cols(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def _output_filename(source_name: str, ext: str) -> str:
-    """
-    Build a download filename from source_name:
-    strip the file extension, remove any trailing date, append today's date.
-    ext should include the dot, e.g. '.csv' or '.xlsx'.
-    """
     stem = source_name
     for e in ('.xlsx', '.xls', '.csv'):
         if stem.lower().endswith(e):
             stem = stem[:-len(e)]
             break
-    # Strip trailing date in common formats: YYYY-MM-DD, DD-MM-YYYY, YYYYMMDD
     stem = re.sub(r'[\s_\-]+\d{4}[\-_\.]\d{2}[\-_\.]\d{2}$', '', stem)
     stem = re.sub(r'[\s_\-]+\d{2}[\-_\.]\d{2}[\-_\.]\d{4}$', '', stem)
     stem = re.sub(r'[\s_\-]+\d{8}$', '', stem)
-    stem = stem.rstrip(' _-')
+    stem = re.sub(r'[^\w]', '_', stem)
+    stem = re.sub(r'_+', '_', stem).strip('_') or 'output'
     return f"{stem}_{date.today().strftime('%Y-%m-%d')}{ext}"
 
 
@@ -577,7 +577,10 @@ def clean_for_output(name: str) -> str:
     n = re.sub(r'\(\s*[Dd]emo[^)]*\)', '', n)   # (Demo Account), (Demo: 34708)
     n = re.sub(r'\b\d{4,}\b', '', n)             # standalone 4+ digit IDs
     n = re.sub(r'\s*\d+\s*$', '', n)             # trailing numbers
+    n = re.sub(r'^\s*\d+\s*', '', n)             # leading numbers
     n = re.sub(r'\(\s*\)', '', n)                # leftover empty parentheses
+    n = re.sub(r'^\s*[-–—]\s*', '', n)           # leading dash left after number removal
+    n = re.sub(r'\s*[-–—]\s*$', '', n)           # trailing dash left after number removal
     n = re.sub(r'\s+', ' ', n).strip()
     return n
 
@@ -603,20 +606,60 @@ def detect_company_col(columns) -> str:
             return col
     return columns[0]
 
+def _unwrap_double_encoded_csv(text):
+    """Some exports wrap every row in an extra layer of CSV quoting, so each
+    row parses as a single field whose content is itself a full CSV row.
+    Detect that pattern, strip the outer layer, and return the rows already
+    split into fields (as a list of lists) rather than reassembled text:
+    the leading field of the inner row is sometimes left unquoted even when
+    it contains a literal comma, which a second blind CSV parse can't tell
+    apart from an actual column boundary. Any such stray split is merged
+    back into the leading field using the header's column count as the
+    source of truth."""
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if len(lines) < 2:
+        return None
+    outer = []
+    for ln in lines:
+        try:
+            fields = next(csv.reader([ln]))
+        except csv.Error:
+            return None
+        if len(fields) != 1:
+            return None
+        outer.append(fields[0])
+    if not any(re.search(r'[,;]', u) for u in outer[:5]):
+        return None
+    rows = [next(csv.reader([u])) for u in outer]
+    n_cols = len(rows[0])
+    for row in rows[1:]:
+        while len(row) > n_cols:
+            row[0:2] = [row[0] + ',' + row[1]]
+    return rows
+
 def read_file(f, nrows=None, sheet_name=0):
     raw = f.read()
     if f.name.lower().endswith('.csv'):
-        sample = raw[:4096].decode('utf-8', errors='replace')
-        try:
-            sep = csv.Sniffer().sniff(sample, delimiters=',;').delimiter
-        except csv.Error:
-            sep = ','
+        text = None
         for encoding in ('utf-8-sig', 'utf-8', 'cp1252', 'latin-1'):
             try:
-                return normalize_country_cols(pd.read_csv(io.BytesIO(raw), sep=sep, nrows=nrows, encoding=encoding))
+                text = raw.decode(encoding)
+                break
             except (UnicodeDecodeError, LookupError):
                 pass
-        return normalize_country_cols(pd.read_csv(io.BytesIO(raw), sep=sep, nrows=nrows, encoding='latin-1', encoding_errors='replace'))
+        if text is None:
+            text = raw.decode('latin-1', errors='replace')
+        rows = _unwrap_double_encoded_csv(text)
+        if rows is not None:
+            df = pd.DataFrame(rows[1:], columns=rows[0])
+            if nrows is not None:
+                df = df.head(nrows)
+            return normalize_country_cols(df)
+        try:
+            sep = csv.Sniffer().sniff(text[:4096], delimiters=',;').delimiter
+        except csv.Error:
+            sep = ','
+        return normalize_country_cols(pd.read_csv(io.StringIO(text), sep=sep, nrows=nrows))
     return normalize_country_cols(pd.read_excel(io.BytesIO(raw), nrows=nrows, sheet_name=sheet_name))
 
 
@@ -727,13 +770,16 @@ def find_symmetric_overlap(names_a: list, names_b: list, threshold: int) -> tupl
 
 
 def store_results(payload: dict) -> None:
-    previous_payload = st.session_state.get(RESULTS_SESSION_KEY)
-    previous_moved = list(st.session_state.get(MOVED_SESSION_KEY, []))
+    previous_payload  = st.session_state.get(RESULTS_SESSION_KEY)
+    previous_moved    = list(st.session_state.get(MOVED_SESSION_KEY, []))
+    previous_rescued  = list(st.session_state.get(DUP_RESCUED_KEY, []))
     st.session_state[RESULTS_SESSION_KEY] = payload
     if previous_payload and previous_payload.get("signature") == payload.get("signature"):
         st.session_state[MOVED_SESSION_KEY] = previous_moved
+        st.session_state[DUP_RESCUED_KEY]   = previous_rescued
     else:
         st.session_state[MOVED_SESSION_KEY] = []
+        st.session_state[DUP_RESCUED_KEY]   = []
 
 
 def get_visible_results():
@@ -745,10 +791,12 @@ def get_visible_results():
     promoted = [item for item in payload["matches"] if item["id"] in moved_ids]
     remaining_matches = [item for item in payload["matches"] if item["id"] not in moved_ids]
 
-    internal_dups = payload.get("internal_dups", [])
-    dup_ids = {item["id_dup"] for item in internal_dups}
-    clean_unique = [idx for idx in payload["unique_new"] if idx not in dup_ids]
-    unique_indices = clean_unique + [item["id"] for item in promoted]
+    internal_dups    = payload.get("internal_dups", [])
+    rescued_dup_ids  = set(st.session_state.get(DUP_RESCUED_KEY, []))
+    dup_ids          = {item["id_dup"] for item in internal_dups if item["id_dup"] not in rescued_dup_ids}
+    clean_unique     = [idx for idx in payload["unique_new"] if idx not in dup_ids]
+    rescued_indices  = [item["id_dup"] for item in internal_dups if item["id_dup"] in rescued_dup_ids]
+    unique_indices   = clean_unique + [item["id"] for item in promoted] + rescued_indices
 
     return {
         "signature": payload["signature"],
@@ -760,6 +808,7 @@ def get_visible_results():
         "df_new_valid": payload["df_new_valid"],
         "new_col": payload["new_col"],
         "internal_dups": internal_dups,
+        "rescued_dup_ids": rescued_dup_ids,
     }
 
 
@@ -775,6 +824,20 @@ def demote_match(match_id: int) -> None:
     if match_id in moved_ids:
         moved_ids.remove(match_id)
         st.session_state[MOVED_SESSION_KEY] = moved_ids
+
+
+def rescue_dup(dup_id: int) -> None:
+    rescued = list(st.session_state.get(DUP_RESCUED_KEY, []))
+    if dup_id not in rescued:
+        rescued.append(dup_id)
+        st.session_state[DUP_RESCUED_KEY] = rescued
+
+
+def unrescue_dup(dup_id: int) -> None:
+    rescued = list(st.session_state.get(DUP_RESCUED_KEY, []))
+    if dup_id in rescued:
+        rescued.remove(dup_id)
+        st.session_state[DUP_RESCUED_KEY] = rescued
 
 
 APPEND_SKIP = "— Skip / leave empty —"
@@ -818,15 +881,178 @@ def _norm_emaildomain(val) -> str:
     return v
 
 
-def append_lists(df_main, df_new, mapping):
-    # mapping: {main_col: source_col_in_df_new | APPEND_SKIP}
-    new_rows = {}
-    for main_col, source in mapping.items():
-        if source == APPEND_SKIP:
-            new_rows[main_col] = [None] * len(df_new)
-        else:
-            new_rows[main_col] = df_new[source].values
-    return pd.concat([df_main, pd.DataFrame(new_rows)], ignore_index=True)
+def rescue_append_row(main_name: str, row_id: str) -> None:
+    rescued = {k: set(v) for k, v in st.session_state.get(APPEND_RESCUED_KEY, {}).items()}
+    rescued.setdefault(main_name, set()).add(row_id)
+    st.session_state[APPEND_RESCUED_KEY] = rescued
+
+
+def unrescue_append_row(main_name: str, row_id: str) -> None:
+    rescued = {k: set(v) for k, v in st.session_state.get(APPEND_RESCUED_KEY, {}).items()}
+    rescued.setdefault(main_name, set()).discard(row_id)
+    st.session_state[APPEND_RESCUED_KEY] = rescued
+
+
+def compute_append_payload(main_name, main_file, main_sheet, mappings, email_col, new_files, sheets_map, ranges_map):
+    """
+    Map every file's rows onto the main list's columns and flag duplicate emails
+    without dropping anything yet — the caller decides what stays out based on
+    which flagged rows the user has since rescued.
+    Returns {main_name, df_main, mapped_rows, skip_map}.
+    mapped_rows carries two bookkeeping columns, "_row_id" and "_source_file",
+    which the renderer strips before the final concat.
+    skip_map: {row_id: {reason, email, comparison, label, row_num, file}}
+    """
+    main_file.seek(0)
+    df_main = read_file(main_file, sheet_name=main_sheet)
+    main_name_col = detect_company_col(df_main.columns.tolist())
+
+    # email -> display label, seeded from the main list, then extended with
+    # every newly-kept row so later files also dedupe against earlier ones.
+    existing_email_map = {}
+    if email_col and email_col in df_main.columns:
+        for _, r in df_main.dropna(subset=[email_col]).iterrows():
+            key = str(r[email_col]).strip().lower()
+            if key and key not in existing_email_map:
+                label = r.get(main_name_col)
+                existing_email_map[key] = str(label).strip() if pd.notna(label) else key
+
+    mapped_chunks = []
+    skip_map = {}
+
+    for ap_file in new_files:
+        if ap_file.name not in mappings:
+            continue
+        ap_file.seek(0)
+        df_ap_new = read_file(ap_file, sheet_name=sheets_map.get(ap_file.name, 0))
+        file_mapping = mappings[ap_file.name]
+        from_r, to_r = ranges_map.get(ap_file.name, (1, len(df_ap_new)))
+        df_slice = df_ap_new.iloc[from_r - 1:to_r].reset_index(drop=True)
+
+        email_source = file_mapping.get(email_col, APPEND_SKIP) if email_col else APPEND_SKIP
+        name_source  = file_mapping.get(main_name_col, APPEND_SKIP)
+
+        row_ids = [f"{main_name}||{ap_file.name}||{from_r + i}" for i in range(len(df_slice))]
+        mapped_full = pd.DataFrame({
+            mc: (df_slice[src].values if src != APPEND_SKIP and src in df_slice.columns
+                 else [None] * len(df_slice))
+            for mc, src in file_mapping.items()
+        })
+        mapped_full["_row_id"]      = row_ids
+        mapped_full["_source_file"] = ap_file.name
+
+        if email_col and email_source != APPEND_SKIP and email_source in df_slice.columns:
+            seen_in_batch = {}
+            for i in range(len(df_slice)):
+                val = df_slice[email_source].iloc[i]
+                key = str(val).strip().lower() if pd.notna(val) else ""
+                if not key:
+                    continue
+                label = None
+                if name_source != APPEND_SKIP and name_source in df_slice.columns:
+                    nv = df_slice[name_source].iloc[i]
+                    if pd.notna(nv) and str(nv).strip():
+                        label = str(nv).strip()
+                if key in existing_email_map:
+                    skip_map[row_ids[i]] = {
+                        "reason": "existing", "email": val,
+                        "comparison": existing_email_map[key],
+                        "label": label or key, "row_num": from_r + i, "file": ap_file.name,
+                    }
+                elif key in seen_in_batch:
+                    skip_map[row_ids[i]] = {
+                        "reason": "internal", "email": val,
+                        "comparison": seen_in_batch[key],
+                        "label": label or key, "row_num": from_r + i, "file": ap_file.name,
+                    }
+                else:
+                    seen_in_batch[key] = label or key
+            # Fold this file's unique emails into the cross-file map only now —
+            # doing it inline above would make same-file dupes match "existing"
+            # (checked first) instead of "internal" before they're ever compared.
+            existing_email_map.update(seen_in_batch)
+
+        for col in mapped_full.columns:
+            if col in ("_row_id", "_source_file"):
+                continue
+            if _is_website_col(col):
+                mapped_full[col] = mapped_full[col].apply(_norm_website)
+            elif _is_emaildomain_col(col):
+                mapped_full[col] = mapped_full[col].apply(_norm_emaildomain)
+
+        mapped_chunks.append(mapped_full)
+
+    mapped_rows = pd.concat(mapped_chunks, ignore_index=True) if mapped_chunks else pd.DataFrame()
+
+    return {
+        "main_name":   main_name,
+        "df_main":     df_main,
+        "mapped_rows": mapped_rows,
+        "skip_map":    skip_map,
+    }
+
+
+def render_append_payload(payload):
+    """Render one main list's append result, applying the current rescue state,
+    and return the final combined DataFrame for download."""
+    main_name   = payload["main_name"]
+    df_main     = payload["df_main"]
+    mapped_rows = payload["mapped_rows"]
+    skip_map    = payload["skip_map"]
+
+    rescued         = st.session_state.get(APPEND_RESCUED_KEY, {}).get(main_name, set())
+    active_skip_ids = {rid for rid in skip_map if rid not in rescued}
+
+    if len(mapped_rows):
+        keep_mask = ~mapped_rows["_row_id"].isin(active_skip_ids)
+        kept_rows = mapped_rows[keep_mask].drop(columns=["_row_id", "_source_file"]).reset_index(drop=True)
+    else:
+        kept_rows = mapped_rows
+
+    df_result     = pd.concat([df_main, kept_rows], ignore_index=True) if len(kept_rows) else df_main.copy()
+    original_rows = len(df_main)
+    appended_rows = len(kept_rows)
+    skipped_count = len(active_skip_ids)
+
+    st.markdown(f'<div class="section-header">&#9632;&nbsp; Result — {main_name}</div>', unsafe_allow_html=True)
+    stat_cols = st.columns(4 if skip_map else 3, gap="small")
+    stat_cols[0].markdown(f'<div class="stat-box"><div class="stat-num">{original_rows:,}</div><div class="stat-label">Main rows</div></div>', unsafe_allow_html=True)
+    stat_cols[1].markdown(f'<div class="stat-box"><div class="stat-num">{appended_rows:,}</div><div class="stat-label">Appended rows</div></div>', unsafe_allow_html=True)
+    if skip_map:
+        stat_cols[2].markdown(f'<div class="stat-box"><div class="stat-num warn">{skipped_count:,}</div><div class="stat-label">Skipped (email)</div></div>', unsafe_allow_html=True)
+    stat_cols[-1].markdown(f'<div class="stat-box"><div class="stat-num">{len(df_result):,}</div><div class="stat-label">Total rows</div></div>', unsafe_allow_html=True)
+
+    st.markdown("")
+    st.dataframe(kept_rows.head(200), use_container_width=True, hide_index=True)
+    if len(kept_rows) > 200:
+        st.markdown(f"<small style='color:#3a4a5e'>Showing first 200 of {len(kept_rows):,} new rows.</small>", unsafe_allow_html=True)
+
+    if skip_map:
+        st.markdown("")
+        st.markdown('<div class="section-header">&#9664;&#9654;&nbsp; Skipped rows (duplicate email)</div>', unsafe_allow_html=True)
+        st.markdown("<small style='color:#3a4a5e'>These rows were left out because their email already exists. Click <strong>Include anyway</strong> if it's not actually a duplicate.</small>", unsafe_allow_html=True)
+        st.markdown("")
+        for rid, info in sorted(skip_map.items(), key=lambda kv: kv[1]["row_num"]):
+            is_rescued = rid in rescued
+            row_l, row_r = st.columns([0.82, 0.18])
+            reason_txt = "already in main list" if info["reason"] == "existing" else "duplicate within this file"
+            with row_l:
+                st.markdown(f"""
+                <div class="match-card" style="{'opacity:0.45' if is_rescued else ''}">
+                  <span class="match-names"><span class="match-main">{info['label']}</span><span class="match-arrow"> {reason_txt} &mdash; </span>{info['comparison']} <span style="color:var(--tx-lo)">({info['email']})</span></span>
+                  <span class="match-score">{info['file']} &middot; row {info['row_num']}</span>
+                </div>""", unsafe_allow_html=True)
+            with row_r:
+                if is_rescued:
+                    if st.button("Remove", key=f"unrescue_ap_{main_name}_{rid}", type="secondary"):
+                        unrescue_append_row(main_name, rid)
+                        st.rerun()
+                else:
+                    if st.button("Include anyway", key=f"rescue_ap_{main_name}_{rid}", type="secondary"):
+                        rescue_append_row(main_name, rid)
+                        st.rerun()
+
+    return df_result
 
 
 # ── UI ────────────────────────────────────────────────────────────────────────
@@ -862,11 +1088,18 @@ with tab1:
         st.markdown('<div class="upload-label">&#9632;&nbsp; 01 &mdash; Main database</div>', unsafe_allow_html=True)
         main_file = st.file_uploader("Main database", type=["xlsx", "xls", "csv"], key="main",
                                       label_visibility="collapsed")
+        if isinstance(main_file, list):
+            if len(main_file) > 1:
+                st.warning("Only one file is allowed here. Using the first file.")
+            main_file = main_file[0] if main_file else None
 
     with col_b:
         st.markdown('<div class="upload-label">&#9632;&nbsp; 02 &mdash; New companies</div>', unsafe_allow_html=True)
-        new_file  = st.file_uploader("New companies to check", type=["xlsx", "xls", "csv"], key="new",
-                                      label_visibility="collapsed")
+        new_files = st.file_uploader("New companies to check", type=["xlsx", "xls", "csv"], key="new",
+                                      accept_multiple_files=True, label_visibility="collapsed")
+        if not isinstance(new_files, list):
+            new_files = [new_files] if new_files else []
+        new_file = new_files[0] if new_files else None
 
     st.markdown("")
 
@@ -891,12 +1124,15 @@ with tab1:
     new_col_choice     = None
     output_col_choices = None
 
-    if main_file and new_file:
+    if main_file and new_files:
+        if len(new_files) > 1:
+            st.info(f"{len(new_files)} files will be combined and screened together. Column configuration is based on the first file.")
         try:
             main_cols = read_file(main_file, nrows=0, sheet_name=main_sheet).columns.tolist()
-            new_cols  = read_file(new_file,  nrows=0, sheet_name=new_sheet).columns.tolist()
+            new_cols  = read_file(new_files[0], nrows=0, sheet_name=new_sheet).columns.tolist()
             main_file.seek(0)
-            new_file.seek(0)
+            for _nf in new_files:
+                _nf.seek(0)
 
             st.markdown('<div class="section-header">&#9632;&nbsp; 03 &mdash; Column to compare</div>', unsafe_allow_html=True)
             col_sel_a, col_sel_b = st.columns(2, gap="medium")
@@ -945,13 +1181,20 @@ with tab1:
     run = st.button("&#9889;  Run Screening", type="primary", use_container_width=True)
 
     if run:
-        if not main_file or not new_file:
+        if not main_file or not new_files:
             st.error("Please upload both files before running.")
         else:
             try:
                 with st.spinner("Reading files…"):
                     df_main = read_file(main_file, sheet_name=main_sheet)
-                    df_new  = read_file(new_file,  sheet_name=new_sheet)
+                    if len(new_files) == 1:
+                        df_new = read_file(new_files[0], sheet_name=new_sheet)
+                    else:
+                        _dfs_new = []
+                        for _i, _nf in enumerate(new_files):
+                            _nf.seek(0)
+                            _dfs_new.append(read_file(_nf, sheet_name=new_sheet if _i == 0 else 0))
+                        df_new = pd.concat(_dfs_new, ignore_index=True)
 
                 main_col = main_col_choice or detect_company_col(df_main.columns.tolist())
                 new_col  = new_col_choice  or detect_company_col(df_new.columns.tolist())
@@ -970,8 +1213,8 @@ with tab1:
                     "signature": {
                         "main_file": getattr(main_file, "name", ""),
                         "main_size": getattr(main_file, "size", None),
-                        "new_file": getattr(new_file, "name", ""),
-                        "new_size": getattr(new_file, "size", None),
+                        "new_file": new_files[0].name if new_files else "",
+                        "new_size": sum(getattr(_nf, "size", 0) for _nf in new_files),
                         "threshold": threshold,
                     },
                     "main_names": main_names,
@@ -996,9 +1239,11 @@ with tab1:
         df_new_valid      = visible_results["df_new_valid"]
         new_col           = visible_results["new_col"]
         internal_dups     = visible_results.get("internal_dups", [])
+        rescued_dup_ids   = visible_results.get("rescued_dup_ids", set())
 
         st.markdown('<div class="section-header">&#9632;&nbsp; Results</div>', unsafe_allow_html=True)
 
+        _active_dups = len([d for d in internal_dups if d["id_dup"] not in rescued_dup_ids])
         s1, s2, s3, s4, s5 = st.columns(5, gap="small")
         with s1:
             st.markdown(f'<div class="stat-box"><div class="stat-num">{len(visible_results["main_names"]):,}</div><div class="stat-label">Main DB</div></div>', unsafe_allow_html=True)
@@ -1007,7 +1252,7 @@ with tab1:
         with s3:
             st.markdown(f'<div class="stat-box"><div class="stat-num warn">{len(remaining_matches):,}</div><div class="stat-label">In Main DB</div></div>', unsafe_allow_html=True)
         with s4:
-            st.markdown(f'<div class="stat-box"><div class="stat-num warn">{len(internal_dups):,}</div><div class="stat-label">List Dups</div></div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="stat-box"><div class="stat-num warn">{_active_dups:,}</div><div class="stat-label">List Dups</div></div>', unsafe_allow_html=True)
         with s5:
             st.markdown(f'<div class="stat-box"><div class="stat-num">{len(unique_indices):,}</div><div class="stat-label">Clean &amp; Unique</div></div>', unsafe_allow_html=True)
 
@@ -1045,28 +1290,15 @@ with tab1:
                                 st.rerun()
 
                 st.markdown("")
-                dl_a, dl_b = st.columns(2, gap="small")
-                csv_bytes = df_out.to_csv(index=False).encode("utf-8-sig")
-                _src_name = visible_results["signature"].get("new_file", "output")
-                with dl_a:
-                    st.download_button(
-                        label="&#11015;  Download CSV",
-                        data=csv_bytes,
-                        file_name=_output_filename(_src_name, ".csv"),
-                        mime="text/csv",
-                        use_container_width=True,
-                    )
-                with dl_b:
-                    excel_buf = io.BytesIO()
-                    with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
-                        df_out.to_excel(writer, index=False, sheet_name="Unique Companies")
-                    st.download_button(
-                        label="&#11015;  Download Excel",
-                        data=excel_buf.getvalue(),
-                        file_name=_output_filename(_src_name, ".xlsx"),
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True,
-                    )
+                _src_name = visible_results["signature"].get("main_file", "output")
+                st.download_button(
+                    label="&#11015;  Download CSV",
+                    data=df_out.to_csv(index=False).encode("utf-8-sig"),
+                    file_name=_output_filename(_src_name, ".csv"),
+                    mime="text/csv",
+                    use_container_width=True,
+                    key="screener_dl_csv",
+                )
             else:
                 st.info("All companies in the new file already exist in the main list.")
 
@@ -1092,19 +1324,31 @@ with tab1:
         if internal_dups:
             st.markdown("")
             st.markdown('<div class="section-header">&#9664;&#9654;&nbsp; Duplicates within the new list</div>', unsafe_allow_html=True)
-            st.markdown("<small style='color:#3a4a5e'>These pairs are fuzzy duplicates of each other inside the uploaded file. Only the first occurrence is kept in the output — the duplicate is excluded.</small>", unsafe_allow_html=True)
+            st.markdown("<small style='color:#3a4a5e'>These pairs are fuzzy duplicates of each other. Only the first occurrence is kept — click <strong>Keep Both</strong> if they are not actually the same company.</small>", unsafe_allow_html=True)
             st.markdown("")
             for dup in sorted(internal_dups, key=lambda d: -d["score"]):
+                is_rescued  = dup["id_dup"] in rescued_dup_ids
                 score_class = "high" if dup["score"] >= 90 else ""
-                st.markdown(f"""
-                <div class="match-card">
-                  <span class="match-names">
-                    <span class="match-main">{dup["name_keeper"]}</span>
-                    <span class="match-arrow"> &lArr; dup &mdash; </span>
-                    {dup["name_dup"]}
-                  </span>
-                  <span class="match-score {score_class}">{dup["score"]}%</span>
-                </div>""", unsafe_allow_html=True)
+                dup_l, dup_r = st.columns([0.82, 0.18])
+                with dup_l:
+                    st.markdown(f"""
+                    <div class="match-card" style="{'opacity:0.45' if is_rescued else ''}">
+                      <span class="match-names">
+                        <span class="match-main">{dup["name_keeper"]}</span>
+                        <span class="match-arrow"> &lArr; dup &mdash; </span>
+                        {dup["name_dup"]}
+                      </span>
+                      <span class="match-score {score_class}">{dup["score"]}%</span>
+                    </div>""", unsafe_allow_html=True)
+                with dup_r:
+                    if is_rescued:
+                        if st.button("Return", key=f"unrescue_dup_{dup['id_dup']}", type="secondary"):
+                            unrescue_dup(dup["id_dup"])
+                            st.rerun()
+                    else:
+                        if st.button("Keep Both", key=f"rescue_dup_{dup['id_dup']}", type="secondary"):
+                            rescue_dup(dup["id_dup"])
+                            st.rerun()
 
     else:
         st.markdown("""
@@ -1120,20 +1364,36 @@ with tab2:
 
     st.markdown("""
 <div class="tab-desc">
-  <strong>List Appender</strong> — merge one or more files into your main list.
-  Map each file's columns to your main list's columns, detect duplicate emails,
-  and download the combined result as a single CSV.
+  <strong>List Appender</strong> — merge one or more files into up to two main lists.
+  Map each file's columns independently per main list, detect duplicate emails,
+  and download each combined result separately.
 </div>""", unsafe_allow_html=True)
 
     # ── Upload ─────────────────────────────────────────────────────────────────
-    ap_col_a, ap_col_b = st.columns(2, gap="medium")
+    if "ap_num_main" not in st.session_state:
+        st.session_state["ap_num_main"] = 1
 
-    with ap_col_a:
-        st.markdown('<div class="upload-label">&#9632;&nbsp; 01 &mdash; Main list</div>', unsafe_allow_html=True)
-        ap_main_file = st.file_uploader("Main list", type=["xlsx", "xls", "csv"], key="ap_main",
-                                         label_visibility="collapsed")
+    ap_col_main, ap_col_new = st.columns(2, gap="medium")
 
-    with ap_col_b:
+    with ap_col_main:
+        st.markdown('<div class="upload-label">&#9632;&nbsp; 01 &mdash; Main list(s)</div>', unsafe_allow_html=True)
+        ap_main_file_1 = st.file_uploader("Main list 1", type=["xlsx", "xls", "csv"], key="ap_main_1",
+                                           label_visibility="collapsed")
+        if st.session_state["ap_num_main"] >= 2:
+            st.markdown("<div style='margin-top:0.3rem'></div>", unsafe_allow_html=True)
+            ap_main_file_2 = st.file_uploader("Main list 2", type=["xlsx", "xls", "csv"], key="ap_main_2",
+                                               label_visibility="collapsed")
+            if st.button("✕  Remove second list", key="ap_remove_main", use_container_width=True):
+                st.session_state["ap_num_main"] = 1
+                st.session_state.pop("ap_main_2", None)
+                st.rerun()
+        else:
+            ap_main_file_2 = None
+            if st.button("＋  Add second main list", key="ap_add_main", use_container_width=True):
+                st.session_state["ap_num_main"] = 2
+                st.rerun()
+
+    with ap_col_new:
         st.markdown('<div class="upload-label">&#9632;&nbsp; 02 &mdash; Files to append</div>', unsafe_allow_html=True)
         ap_new_files = st.file_uploader("Files to append", type=["xlsx", "xls", "csv"], key="ap_new",
                                          accept_multiple_files=True, label_visibility="collapsed")
@@ -1141,30 +1401,58 @@ with tab2:
     st.markdown("")
 
     # ── Sheet selection (Excel only) ────────────────────────────────────────────
-    ap_main_sheet = 0
+    ap_main_sheet_1 = 0
+    ap_main_sheet_2 = 0
 
-    if ap_main_file and not ap_main_file.name.lower().endswith('.csv'):
-        _ams = get_excel_sheets(ap_main_file)
-        if _ams:
-            ap_main_sheet = st.selectbox("Sheet — Main list", _ams, key="ap_main_sheet")
-            st.markdown("")
+    _sheet_selectors = []
+    if ap_main_file_1 and not ap_main_file_1.name.lower().endswith('.csv'):
+        _ams1 = get_excel_sheets(ap_main_file_1)
+        if _ams1:
+            _sheet_selectors.append(("Sheet — Main list 1", _ams1, "ap_main_sheet_1", 1))
+    if ap_main_file_2 and not ap_main_file_2.name.lower().endswith('.csv'):
+        _ams2 = get_excel_sheets(ap_main_file_2)
+        if _ams2:
+            _sheet_selectors.append(("Sheet — Main list 2", _ams2, "ap_main_sheet_2", 2))
+
+    if _sheet_selectors:
+        _sc = st.columns(len(_sheet_selectors), gap="small")
+        for _i, (_lbl, _sheets, _key, _which) in enumerate(_sheet_selectors):
+            with _sc[_i]:
+                _sel = st.selectbox(_lbl, _sheets, key=_key)
+                if _which == 1:
+                    ap_main_sheet_1 = _sel
+                else:
+                    ap_main_sheet_2 = _sel
+        st.markdown("")
 
     # ── Per-file column mapping ─────────────────────────────────────────────────
-    ap_mappings  = {}   # {filename: {main_col: source_col | APPEND_SKIP}}
-    ap_ranges    = {}   # {filename: (from_row, to_row)}  1-indexed, to_row=0 means all
-    ap_sheets    = {}   # {filename: sheet_name}
-    ap_email_col = None
+    ap_mappings_1 = {}   # {filename: {main1_col: source_col | APPEND_SKIP}}
+    ap_mappings_2 = {}   # {filename: {main2_col: source_col | APPEND_SKIP}}
+    ap_ranges     = {}   # {filename: (from_row, to_row)}
+    ap_sheets     = {}   # {filename: sheet_name}
+    ap_email_col_1 = None
+    ap_email_col_2 = None
 
-    if ap_main_file and ap_new_files:
+    if ap_main_file_1 and ap_new_files:
         try:
-            ap_main_cols = read_file(ap_main_file, nrows=0, sheet_name=ap_main_sheet).columns.tolist()
-            ap_main_file.seek(0)
+            ap_main_cols_1 = read_file(ap_main_file_1, nrows=0, sheet_name=ap_main_sheet_1).columns.tolist()
+            ap_main_file_1.seek(0)
         except Exception:
-            ap_main_cols = []
+            ap_main_cols_1 = []
 
-        if ap_main_cols:
+        try:
+            ap_main_cols_2 = (
+                read_file(ap_main_file_2, nrows=0, sheet_name=ap_main_sheet_2).columns.tolist()
+                if ap_main_file_2 else []
+            )
+            if ap_main_file_2:
+                ap_main_file_2.seek(0)
+        except Exception:
+            ap_main_cols_2 = []
+
+        if ap_main_cols_1:
             st.markdown('<div class="section-header">&#9632;&nbsp; 03 &mdash; Column mapping</div>', unsafe_allow_html=True)
-            st.markdown("<small style='color:#3a4a5e'>Each file gets its own mapping. For every column in the main list, pick the matching column from that file — or skip it.</small>", unsafe_allow_html=True)
+            st.markdown("<small style='color:#3a4a5e'>For every column in each main list, pick the matching column from the file to append — or skip it.</small>", unsafe_allow_html=True)
             st.markdown("")
 
             for ap_file in ap_new_files:
@@ -1191,30 +1479,56 @@ with tab2:
                         continue
 
                     MAP_OPTIONS = [APPEND_SKIP] + ap_new_cols
-                    file_mapping = {}
 
+                    # ── Mapping → Main list 1 ──────────────────────────────────
+                    file_mapping_1 = {}
+                    st.markdown(f"<small style='color:#3a4a5e;font-family:JetBrains Mono,monospace;text-transform:uppercase;letter-spacing:0.08em'>&#9654;&nbsp; Mapping to {ap_main_file_1.name}</small>", unsafe_allow_html=True)
                     hdr_l, hdr_r = st.columns([1, 2])
                     with hdr_l:
-                        st.markdown("<small style='color:#2a3a4e;font-family:JetBrains Mono,monospace;text-transform:uppercase;letter-spacing:0.1em'>Main list column</small>", unsafe_allow_html=True)
+                        st.markdown("<small style='color:#2a3a4e;font-family:JetBrains Mono,monospace'>Main list 1 column</small>", unsafe_allow_html=True)
                     with hdr_r:
-                        st.markdown("<small style='color:#2a3a4e;font-family:JetBrains Mono,monospace;text-transform:uppercase;letter-spacing:0.1em'>Column from this file</small>", unsafe_allow_html=True)
-
-                    for mc in ap_main_cols:
+                        st.markdown("<small style='color:#2a3a4e;font-family:JetBrains Mono,monospace'>Column from this file</small>", unsafe_allow_html=True)
+                    for mc in ap_main_cols_1:
                         auto_match = next((c for c in ap_new_cols if col_key(c) == col_key(mc)), None)
                         default_idx = ap_new_cols.index(auto_match) + 1 if auto_match else 0
                         map_l, map_r = st.columns([1, 2])
                         with map_l:
                             st.markdown(f"<div style='padding:0.45rem 0;font-family:JetBrains Mono,monospace;font-size:0.8rem;color:#c9d1e0'>{mc}</div>", unsafe_allow_html=True)
                         with map_r:
-                            file_mapping[mc] = st.selectbox(
+                            file_mapping_1[mc] = st.selectbox(
                                 mc,
                                 MAP_OPTIONS,
                                 index=default_idx,
-                                key=f"ap_map_{ap_file.name}_{mc}",
+                                key=f"ap_map_1_{ap_file.name}_{mc}",
                                 label_visibility="collapsed",
                             )
+                    ap_mappings_1[ap_file.name] = file_mapping_1
 
-                    ap_mappings[ap_file.name] = file_mapping
+                    # ── Mapping → Main list 2 (if uploaded) ───────────────────
+                    if ap_main_cols_2:
+                        st.markdown("")
+                        file_mapping_2 = {}
+                        st.markdown(f"<small style='color:#3a4a5e;font-family:JetBrains Mono,monospace;text-transform:uppercase;letter-spacing:0.08em'>&#9654;&nbsp; Mapping to {ap_main_file_2.name}</small>", unsafe_allow_html=True)
+                        hdr_l2, hdr_r2 = st.columns([1, 2])
+                        with hdr_l2:
+                            st.markdown("<small style='color:#2a3a4e;font-family:JetBrains Mono,monospace'>Main list 2 column</small>", unsafe_allow_html=True)
+                        with hdr_r2:
+                            st.markdown("<small style='color:#2a3a4e;font-family:JetBrains Mono,monospace'>Column from this file</small>", unsafe_allow_html=True)
+                        for mc2 in ap_main_cols_2:
+                            auto_match2 = next((c for c in ap_new_cols if col_key(c) == col_key(mc2)), None)
+                            default_idx2 = ap_new_cols.index(auto_match2) + 1 if auto_match2 else 0
+                            map_l2, map_r2 = st.columns([1, 2])
+                            with map_l2:
+                                st.markdown(f"<div style='padding:0.45rem 0;font-family:JetBrains Mono,monospace;font-size:0.8rem;color:#c9d1e0'>{mc2}</div>", unsafe_allow_html=True)
+                            with map_r2:
+                                file_mapping_2[mc2] = st.selectbox(
+                                    mc2,
+                                    MAP_OPTIONS,
+                                    index=default_idx2,
+                                    key=f"ap_map_2_{ap_file.name}_{mc2}",
+                                    label_visibility="collapsed",
+                                )
+                        ap_mappings_2[ap_file.name] = file_mapping_2
 
                     st.markdown("<div style='margin-top:0.8rem;margin-bottom:0.2rem'><small style='color:#3a4a5e;font-family:JetBrains Mono,monospace;text-transform:uppercase;letter-spacing:0.1em'>&#9632;&nbsp; Row range</small></div>", unsafe_allow_html=True)
                     _range_l, _range_r = st.columns(2, gap="small")
@@ -1231,120 +1545,112 @@ with tab2:
             st.markdown("")
             st.markdown('<div class="section-header">&#9632;&nbsp; 04 &mdash; Email duplicate check</div>', unsafe_allow_html=True)
             EMAIL_SKIP = "— No email check —"
-            email_auto = next((c for c in ap_main_cols if 'email' in col_key(c) or col_key(c) == 'mail'), None)
-            email_options = [EMAIL_SKIP] + ap_main_cols
-            email_default = email_options.index(email_auto) if email_auto else 0
-            ap_email_col_choice = st.selectbox(
-                "Skip rows whose **{col}** already exists in the main list".format(
-                    col=st.session_state.get("ap_email_col", email_options[email_default])
-                    if st.session_state.get("ap_email_col", email_options[email_default]) != EMAIL_SKIP
-                    else "selected column"
-                ),
-                email_options,
-                index=email_default,
-                key="ap_email_col",
-            )
-            ap_email_col = None if ap_email_col_choice == EMAIL_SKIP else ap_email_col_choice
+            _email_cols = st.columns(2 if ap_main_cols_2 else 1, gap="small")
+
+            with _email_cols[0]:
+                if ap_main_cols_2:
+                    st.markdown("<small style='color:#3a4a5e'>Main list 1</small>", unsafe_allow_html=True)
+                email_auto_1 = next((c for c in ap_main_cols_1 if 'email' in col_key(c) or col_key(c) == 'mail'), None)
+                email_options_1 = [EMAIL_SKIP] + ap_main_cols_1
+                email_default_1 = email_options_1.index(email_auto_1) if email_auto_1 else 0
+                ap_email_col_choice_1 = st.selectbox(
+                    "Email col — Main list 1",
+                    email_options_1,
+                    index=email_default_1,
+                    key="ap_email_col_1",
+                    label_visibility="collapsed",
+                )
+                ap_email_col_1 = None if ap_email_col_choice_1 == EMAIL_SKIP else ap_email_col_choice_1
+
+            if ap_main_cols_2:
+                with _email_cols[1]:
+                    st.markdown("<small style='color:#3a4a5e'>Main list 2</small>", unsafe_allow_html=True)
+                    email_auto_2 = next((c for c in ap_main_cols_2 if 'email' in col_key(c) or col_key(c) == 'mail'), None)
+                    email_options_2 = [EMAIL_SKIP] + ap_main_cols_2
+                    email_default_2 = email_options_2.index(email_auto_2) if email_auto_2 else 0
+                    ap_email_col_choice_2 = st.selectbox(
+                        "Email col — Main list 2",
+                        email_options_2,
+                        index=email_default_2,
+                        key="ap_email_col_2",
+                        label_visibility="collapsed",
+                    )
+                    ap_email_col_2 = None if ap_email_col_choice_2 == EMAIL_SKIP else ap_email_col_choice_2
+
             st.markdown("")
 
     ap_run = st.button("&#9889;  Append Lists", type="primary", use_container_width=True)
 
     if ap_run:
-        if not ap_main_file or not ap_new_files:
-            st.error("Please upload the main list and at least one file to append.")
-        elif not ap_mappings:
+        if not ap_main_file_1 or not ap_new_files:
+            st.error("Please upload at least Main list 1 and one file to append.")
+        elif not ap_mappings_1:
             st.error("Column mapping could not be determined. Check your files.")
         else:
             try:
-                with st.spinner("Reading files…"):
-                    df_result = read_file(ap_main_file, sheet_name=ap_main_sheet)
+                _runs = [(ap_main_file_1.name, ap_main_file_1, ap_main_sheet_1, ap_mappings_1, ap_email_col_1)]
+                if ap_main_file_2 and ap_mappings_2:
+                    _runs.append((ap_main_file_2.name, ap_main_file_2, ap_main_sheet_2, ap_mappings_2, ap_email_col_2))
 
-                _original_main_rows = len(df_result)
-                total_appended = 0
-                total_skipped  = 0
-                for ap_file in ap_new_files:
-                    if ap_file.name not in ap_mappings:
-                        continue
-                    with st.spinner(f"Merging {ap_file.name}…"):
-                        df_ap_new   = read_file(ap_file, sheet_name=ap_sheets.get(ap_file.name, 0))
-                        file_mapping = ap_mappings[ap_file.name]
-
-                        # Apply row range (1-indexed)
-                        _from_r, _to_r = ap_ranges.get(ap_file.name, (1, len(df_ap_new)))
-                        df_ap_new = df_ap_new.iloc[_from_r - 1:_to_r].reset_index(drop=True)
-
-                        # Email deduplication filter
-                        if ap_email_col and ap_email_col in df_result.columns:
-                            email_source = file_mapping.get(ap_email_col, APPEND_SKIP)
-                            if email_source != APPEND_SKIP and email_source in df_ap_new.columns:
-                                # Check against main list + all previously appended rows
-                                existing_emails = set(
-                                    df_result[ap_email_col].dropna().astype(str).str.lower().str.strip()
-                                )
-                                mask = ~df_ap_new[email_source].astype(str).str.lower().str.strip().isin(existing_emails)
-                                total_skipped += (~mask).sum()
-                                df_ap_new = df_ap_new[mask].reset_index(drop=True)
-                                # Also deduplicate within this file itself
-                                before_internal = len(df_ap_new)
-                                df_ap_new = df_ap_new.drop_duplicates(subset=[email_source], keep='first').reset_index(drop=True)
-                                total_skipped += before_internal - len(df_ap_new)
-
-                        rows_before = len(df_result)
-                        df_result = append_lists(df_result, df_ap_new, file_mapping)
-                        for _col in df_result.columns:
-                            if _is_website_col(_col):
-                                df_result.loc[rows_before:, _col] = (
-                                    df_result.loc[rows_before:, _col].apply(_norm_website)
-                                )
-                            elif _is_emaildomain_col(_col):
-                                df_result.loc[rows_before:, _col] = (
-                                    df_result.loc[rows_before:, _col].apply(_norm_emaildomain)
-                                )
-                        total_appended += len(df_result) - rows_before
-
-                st.markdown('<div class="section-header">&#9632;&nbsp; Result</div>', unsafe_allow_html=True)
-                _stat_cols = st.columns(4 if total_skipped else 3, gap="small")
-                _stat_cols[0].markdown(f'<div class="stat-box"><div class="stat-num">{len(df_result) - total_appended:,}</div><div class="stat-label">Main rows</div></div>', unsafe_allow_html=True)
-                _stat_cols[1].markdown(f'<div class="stat-box"><div class="stat-num">{total_appended:,}</div><div class="stat-label">Appended rows</div></div>', unsafe_allow_html=True)
-                if total_skipped:
-                    _stat_cols[2].markdown(f'<div class="stat-box"><div class="stat-num warn">{total_skipped:,}</div><div class="stat-label">Skipped (email)</div></div>', unsafe_allow_html=True)
-                _stat_cols[-1].markdown(f'<div class="stat-box"><div class="stat-num">{len(df_result):,}</div><div class="stat-label">Total rows</div></div>', unsafe_allow_html=True)
-
-                st.markdown("")
-                _df_new_rows = df_result.iloc[_original_main_rows:].reset_index(drop=True)
-                st.dataframe(_df_new_rows.head(200), use_container_width=True, hide_index=True)
-                if len(_df_new_rows) > 200:
-                    st.markdown(f"<small style='color:#3a4a5e'>Showing first 200 of {len(_df_new_rows):,} new rows.</small>", unsafe_allow_html=True)
-
-                st.markdown("")
-                ap_dl_a, ap_dl_b = st.columns(2, gap="small")
-                ap_csv = df_result.to_csv(index=False).encode("utf-8-sig")
-                _ap_src_name = getattr(ap_main_file, "name", "output")
-                with ap_dl_a:
-                    st.download_button(
-                        label="&#11015;  Download CSV",
-                        data=ap_csv,
-                        file_name=_output_filename(_ap_src_name, ".csv"),
-                        mime="text/csv",
-                        use_container_width=True,
-                    )
-                with ap_dl_b:
-                    ap_excel_buf = io.BytesIO()
-                    with pd.ExcelWriter(ap_excel_buf, engine="openpyxl") as writer:
-                        df_result.to_excel(writer, index=False, sheet_name="Appended List")
-                    st.download_button(
-                        label="&#11015;  Download Excel",
-                        data=ap_excel_buf.getvalue(),
-                        file_name=_output_filename(_ap_src_name, ".xlsx"),
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True,
-                    )
+                _payloads = []
+                for _name, _mf, _ms, _maps, _ecol in _runs:
+                    with st.spinner(f"Merging into {_name}…"):
+                        _payloads.append(
+                            compute_append_payload(_name, _mf, _ms, _maps, _ecol, ap_new_files, ap_sheets, ap_ranges)
+                        )
+                st.session_state[APPEND_RESULTS_KEY] = _payloads
+                st.session_state[APPEND_RESCUED_KEY] = {}
 
             except Exception as e:
                 st.error(f"Something went wrong: {e}")
                 st.exception(e)
 
-    elif not (ap_main_file and ap_new_files):
+    _append_payloads = st.session_state.get(APPEND_RESULTS_KEY)
+
+    if _append_payloads:
+        _results = []
+        for _payload in _append_payloads:
+            _df_res = render_append_payload(_payload)
+            _results.append((_payload["main_name"], _df_res))
+            st.markdown("")
+
+        # ── Serialise download data into session state ─────────────────
+        if len(_results) == 1:
+            _sn, _df = _results[0]
+            st.session_state["ap_dl"] = {
+                "data":  _df.to_csv(index=False).encode("utf-8-sig"),
+                "name":  _output_filename(_sn, ".csv"),
+                "mime":  "text/csv",
+                "label": "&#11015;  Download CSV",
+            }
+        else:
+            _zip_buf = io.BytesIO()
+            with zipfile.ZipFile(_zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as _zf:
+                for _sn, _df in _results:
+                    _zf.writestr(
+                        _output_filename(_sn, ".csv"),
+                        _df.to_csv(index=False).encode("utf-8-sig"),
+                    )
+            st.session_state["ap_dl"] = {
+                "data":  _zip_buf.getvalue(),
+                "name":  "appended_lists.zip",
+                "mime":  "application/zip",
+                "label": "&#11015;  Download all (ZIP)",
+            }
+
+    if st.session_state.get("ap_dl"):
+        _dl = st.session_state["ap_dl"]
+        st.download_button(
+            label=_dl["label"],
+            data=_dl["data"],
+            file_name=_dl["name"],
+            mime=_dl["mime"],
+            use_container_width=True,
+            key="appender_dl",
+        )
+        st.markdown("")
+
+    elif not (ap_main_file_1 and ap_new_files):
         st.markdown("""
         <div style='background:linear-gradient(135deg,#0d1117,#0c1520);border:1px dashed #1e2d3d;border-radius:10px;padding:2.5rem;text-align:center;margin-top:1rem'>
           <div style='font-family:JetBrains Mono,monospace;font-size:2rem;color:#1a2d3e;margin-bottom:0.8rem'>&#9632;</div>
