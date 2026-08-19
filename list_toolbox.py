@@ -600,10 +600,16 @@ def col_key(s: str) -> str:
     return re.sub(r'[\s_\-]+', '', s.lower())
 
 def detect_company_col(columns) -> str:
-    hints = ['company', 'name', 'organisation', 'organization', 'firm', 'account']
-    for col in columns:
-        if any(h in col.lower() for h in hints):
-            return col
+    # Checked strongest-hint-first across ALL columns, not first-column-first —
+    # otherwise a "Full Name" column ahead of "Company Name" wins on the bare
+    # "name" substring, and headers like "...Company Filter" false-match "company".
+    priority_hints = ['company name', 'company', 'organisation', 'organization', 'account name', 'firm']
+    fallback_hints = ['name', 'account']
+    lower_cols = [c.lower() for c in columns]
+    for hint in priority_hints + fallback_hints:
+        for col, lc in zip(columns, lower_cols):
+            if hint in lc:
+                return col
     return columns[0]
 
 def _unwrap_double_encoded_csv(text):
