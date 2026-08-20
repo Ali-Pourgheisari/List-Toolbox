@@ -1670,10 +1670,10 @@ with tab3:
 
     st.markdown("""
 <div class="tab-desc">
-  <strong>List Diff</strong> — merge several secondary lists together, then compare the
-  result against your main list. Any entry found in <em>both</em> is redundant and gets
-  removed from both sides — what's left is only in the main list, or only in the
-  secondary lists, never both.
+  <strong>List Diff</strong> — merge several secondary lists together, dedup the result on
+  a column you choose, then compare it against your main list. Any entry found in
+  <em>both</em> is redundant and gets removed from both sides — what's left is only in
+  the main list, or only in the secondary lists, never both.
 </div>""", unsafe_allow_html=True)
 
     # ── Upload ─────────────────────────────────────────────────────────────────
@@ -1701,8 +1701,10 @@ with tab3:
 
     # ── Column selection ────────────────────────────────────────────────────────
     ld_main_col_choice = None
+    ld_dedup_col_choice = None
     ld_sec_cols   = {}   # {filename: compare_col}
     ld_sec_sheets = {}   # {filename: sheet_name}
+    ld_sec_col_union = []   # union of all secondary files' columns, in first-seen order
 
     if ld_main_file and ld_secondary_files:
         try:
@@ -1752,9 +1754,25 @@ with tab3:
                         key=f"ld_col_{ld_file.name}",
                     )
 
+                    for _c in ld_cols_preview:
+                        if _c not in ld_sec_col_union:
+                            ld_sec_col_union.append(_c)
+
             st.markdown("")
 
-    st.markdown('<div class="section-header">&#9632;&nbsp; 04 &mdash; Match sensitivity</div>', unsafe_allow_html=True)
+            if ld_sec_col_union:
+                st.markdown('<div class="section-header">&#9632;&nbsp; 04 &mdash; Deduplicate secondary lists</div>', unsafe_allow_html=True)
+                st.markdown("<small style='color:#3a4a5e'>After merging, rows whose value in this column fuzzy-match each other are collapsed to one &mdash; the first occurrence is kept.</small>", unsafe_allow_html=True)
+                st.markdown("")
+                default_ld_dedup = detect_company_col(ld_sec_col_union)
+                ld_dedup_col_choice = st.selectbox(
+                    "Deduplicate merged secondary list on column",
+                    ld_sec_col_union,
+                    index=ld_sec_col_union.index(default_ld_dedup),
+                )
+                st.markdown("")
+
+    st.markdown('<div class="section-header">&#9632;&nbsp; 05 &mdash; Match sensitivity</div>', unsafe_allow_html=True)
 
     ld_thresh_col, ld_hint_col = st.columns([3, 1])
     with ld_thresh_col:
@@ -1802,6 +1820,16 @@ with tab3:
                     st.error("Could not read any of the secondary files.")
                 else:
                     df_sec_merged = pd.concat(sec_frames, ignore_index=True, sort=False)
+                    sec_count_before_dedup = len(df_sec_merged)
+
+                    with st.spinner("Deduping merged secondary list…"):
+                        dedup_col_ld = ld_dedup_col_choice if ld_dedup_col_choice in df_sec_merged.columns else "__ld_compare__"
+                        dedup_values_ld = df_sec_merged[dedup_col_ld].fillna("").astype(str).tolist()
+                        internal_dups_ld = find_internal_duplicates(dedup_values_ld, ld_threshold)
+                        dup_ids_ld = {d["id_dup"] for d in internal_dups_ld}
+                        dedup_idx_ld = [i for i in range(len(df_sec_merged)) if i not in dup_ids_ld]
+                        df_sec_merged = df_sec_merged.iloc[dedup_idx_ld].reset_index(drop=True)
+
                     sec_values = df_sec_merged["__ld_compare__"].tolist()
 
                     with st.spinner("Comparing against main list…"):
@@ -1825,7 +1853,8 @@ with tab3:
                     st.session_state["ld_result"] = {
                         "df": df_diff_result,
                         "main_count": len(main_values),
-                        "sec_count": len(sec_values),
+                        "sec_count": sec_count_before_dedup,
+                        "internal_dups": internal_dups_ld,
                         "overlaps": overlaps,
                         "main_file_name": getattr(ld_main_file, "name", "list_diff"),
                     }
@@ -1841,14 +1870,16 @@ with tab3:
 
         st.markdown('<div class="section-header">&#9632;&nbsp; Result</div>', unsafe_allow_html=True)
 
-        ld_s1, ld_s2, ld_s3, ld_s4 = st.columns(4, gap="small")
+        ld_s1, ld_s2, ld_s3, ld_s4, ld_s5 = st.columns(5, gap="small")
         with ld_s1:
             st.markdown(f'<div class="stat-box"><div class="stat-num">{ld_result["main_count"]:,}</div><div class="stat-label">Main rows</div></div>', unsafe_allow_html=True)
         with ld_s2:
             st.markdown(f'<div class="stat-box"><div class="stat-num">{ld_result["sec_count"]:,}</div><div class="stat-label">Secondary rows (merged)</div></div>', unsafe_allow_html=True)
         with ld_s3:
-            st.markdown(f'<div class="stat-box"><div class="stat-num warn">{len(ld_result["overlaps"]):,}</div><div class="stat-label">Redundant pairs removed</div></div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="stat-box"><div class="stat-num warn">{len(ld_result["internal_dups"]):,}</div><div class="stat-label">Secondary dups removed</div></div>', unsafe_allow_html=True)
         with ld_s4:
+            st.markdown(f'<div class="stat-box"><div class="stat-num warn">{len(ld_result["overlaps"]):,}</div><div class="stat-label">Redundant pairs removed</div></div>', unsafe_allow_html=True)
+        with ld_s5:
             st.markdown(f'<div class="stat-box"><div class="stat-num">{len(df_diff_result):,}</div><div class="stat-label">Unique rows</div></div>', unsafe_allow_html=True)
 
         st.markdown("")
@@ -1884,6 +1915,21 @@ with tab3:
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
             )
+
+        if ld_result["internal_dups"]:
+            st.markdown("")
+            st.markdown('<div class="section-header">&#9664;&#9654;&nbsp; Duplicates merged within the secondary lists</div>', unsafe_allow_html=True)
+            for dup in sorted(ld_result["internal_dups"], key=lambda d: -d["score"]):
+                score_class = "high" if dup["score"] >= 90 else ""
+                st.markdown(f"""
+                <div class="match-card">
+                  <span class="match-names">
+                    <span class="match-main">{dup["name_keeper"]}</span>
+                    <span class="match-arrow"> &lArr; dup &mdash; </span>
+                    {dup["name_dup"]}
+                  </span>
+                  <span class="match-score {score_class}">{dup["score"]}%</span>
+                </div>""", unsafe_allow_html=True)
 
         if ld_result["overlaps"]:
             st.markdown("")
