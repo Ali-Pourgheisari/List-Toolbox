@@ -1809,11 +1809,16 @@ with tab3:
                             main_values, sec_values, ld_threshold
                         )
 
+                    source_col_name = "Source"
+                    existing_cols_ld = set(df_main_valid.columns) | set(df_sec_merged.columns)
+                    while source_col_name in existing_cols_ld:
+                        source_col_name = f"List Diff {source_col_name}"
+
                     df_main_result = df_main_valid.iloc[keep_main_idx].copy()
-                    df_main_result.insert(0, "Source", "Main")
+                    df_main_result.insert(0, source_col_name, "Main")
 
                     df_sec_result = df_sec_merged.iloc[keep_sec_idx].drop(columns=["__ld_compare__"]).copy()
-                    df_sec_result.insert(0, "Source", "Secondary")
+                    df_sec_result.insert(0, source_col_name, "Secondary")
 
                     df_diff_result = pd.concat([df_main_result, df_sec_result], ignore_index=True, sort=False)
 
