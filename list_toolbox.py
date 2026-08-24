@@ -1702,6 +1702,7 @@ with tab3:
     # ── Column selection ────────────────────────────────────────────────────────
     ld_main_col_choice = None
     ld_dedup_col_choice = None
+    ld_output_cols_choice = None
     ld_sec_cols   = {}   # {filename: compare_col}
     ld_sec_sheets = {}   # {filename: sheet_name}
     ld_sec_col_union = []   # union of all secondary files' columns, in first-seen order
@@ -1772,7 +1773,18 @@ with tab3:
                 )
                 st.markdown("")
 
-    st.markdown('<div class="section-header">&#9632;&nbsp; 05 &mdash; Match sensitivity</div>', unsafe_allow_html=True)
+            ld_output_col_union = ld_main_cols + [c for c in ld_sec_col_union if c not in ld_main_cols]
+            st.markdown('<div class="section-header">&#9632;&nbsp; 05 &mdash; Output columns</div>', unsafe_allow_html=True)
+            st.markdown("<small style='color:#3a4a5e'>Columns to keep in the result &mdash; a 'Source' column marking Main/Secondary is always included.</small>", unsafe_allow_html=True)
+            st.markdown("")
+            ld_output_cols_choice = st.multiselect(
+                "Columns to include in the output",
+                ld_output_col_union,
+                default=ld_output_col_union,
+            )
+            st.markdown("")
+
+    st.markdown('<div class="section-header">&#9632;&nbsp; 06 &mdash; Match sensitivity</div>', unsafe_allow_html=True)
 
     ld_thresh_col, ld_hint_col = st.columns([3, 1])
     with ld_thresh_col:
@@ -1849,6 +1861,10 @@ with tab3:
                     df_sec_result.insert(0, source_col_name, "Secondary")
 
                     df_diff_result = pd.concat([df_main_result, df_sec_result], ignore_index=True, sort=False)
+
+                    if ld_output_cols_choice:
+                        _keep_cols_ld = [source_col_name] + [c for c in ld_output_cols_choice if c in df_diff_result.columns and c != source_col_name]
+                        df_diff_result = df_diff_result[_keep_cols_ld]
 
                     st.session_state["ld_result"] = {
                         "df": df_diff_result,
