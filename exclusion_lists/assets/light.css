@@ -1,0 +1,30 @@
+  :root {
+    --bg:         #f2f5fb;
+    --bg-card:    #ffffff;
+    --bg-card-b:  #eef2fa;
+    --bg-inset:   #e8edf8;
+    --bd:         #cdd5e8;
+    --bd-dim:     #e2e8f4;
+    --bd-hover:   #a0b0cc;
+    --tx:         #252e42;
+    --tx-h:       #0f1623;
+    --tx-dim:     #647088;
+    --tx-lo:      #8898b4;
+    --tx-mid:     #506078;
+    --accent:     #00835a;
+    --accent-2:   #007050;
+    --accent-3:   #006044;
+    --accent-bg:  rgba(0,131,90,0.09);
+    --accent-gl:  rgba(0,131,90,0.14);
+    --accent-gl2: rgba(0,131,90,0.22);
+    --accent-bd:  #a8d8c0;
+    --warn:       #c94510;
+    --warn-bg:    rgba(201,69,16,0.1);
+    --btn-tx:     #ffffff;
+    --sec-bg:     #eef2fa;
+    --sec-bg-h:   #e2e8f4;
+  }
+  .stApp { background: var(--bg) !important; color: var(--tx) !important; }
+  .stTabs [aria-selected="true"] {
+    border-bottom-color: var(--bg) !important;
+  }
