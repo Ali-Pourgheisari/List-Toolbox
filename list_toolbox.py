@@ -3,7 +3,6 @@ import pandas as pd
 import re
 import io
 import csv
-import zipfile
 from datetime import date
 from rapidfuzz import fuzz, process
 
@@ -369,11 +368,14 @@ SUFFIXES = re.compile(
 )
 
 RESULTS_SESSION_KEY = "screener_results"
-MOVED_SESSION_KEY   = "screener_moved_match_ids"
-DUP_RESCUED_KEY     = "screener_rescued_dup_ids"
 
-APPEND_RESULTS_KEY = "appender_results"
-APPEND_RESCUED_KEY = "appender_rescued_row_ids"
+# Every duplicate — matched by name or by an identity key — is overridden the same
+# way: one set of row ids the user has forced into the output.
+DUP_EXEMPT_KEY = "dup_exempt_row_ids"
+
+# Streamlit gives an expander no state of its own, so remember that the user is
+# working inside one and re-open it on the next rerun.
+DUPS_OPEN_KEY = "sa_dups_open"
 
 # ── Country normalisation ─────────────────────────────────────────────────────
 # Maps every known variant (lowercase) → canonical short code.
@@ -599,48 +601,113 @@ def col_key(s: str) -> str:
     """Normalize a column name for loose matching: lowercase, strip spaces/underscores/hyphens."""
     return re.sub(r'[\s_\-]+', '', s.lower())
 
+# Headers that contain a company hint but hold something other than its name:
+# "companywebsite" and "companyemaildomain" would otherwise win on "company".
+NON_NAME_HINTS = ('website', 'webpage', 'url', 'email', 'mail', 'domain', 'country',
+                  'phone', 'street', 'city', 'zip', 'postcode', 'linkedin', 'revenue',
+                  'employee')
+
+EXACT_NAME_HEADERS = ('company name', 'company', 'organisation', 'organization',
+                      'account name', 'name', 'account')
+
+
 def detect_company_col(columns) -> str:
     # Checked strongest-hint-first across ALL columns, not first-column-first —
     # otherwise a "Full Name" column ahead of "Company Name" wins on the bare
     # "name" substring, and headers like "...Company Filter" false-match "company".
     priority_hints = ['company name', 'company', 'organisation', 'organization', 'account name', 'firm']
     fallback_hints = ['name', 'account']
-    lower_cols = [c.lower() for c in columns]
+    lower_cols = [c.lower().strip() for c in columns]
+
+    # An exact header beats any substring match.
+    for exact in EXACT_NAME_HEADERS:
+        for col, lc in zip(columns, lower_cols):
+            if lc == exact:
+                return col
+
+    # Substring matches, skipping headers that clearly hold something else.
+    for hint in priority_hints + fallback_hints:
+        for col, lc in zip(columns, lower_cols):
+            if hint in lc and not any(bad in lc for bad in NON_NAME_HINTS):
+                return col
+
+    # Nothing clean matched, so fall back to the original laxer sweep.
     for hint in priority_hints + fallback_hints:
         for col, lc in zip(columns, lower_cols):
             if hint in lc:
                 return col
     return columns[0]
 
-def _unwrap_double_encoded_csv(text):
+CSV_DELIMITERS = (',', ';', '\t', '|')
+
+
+def sniff_delimiter(text: str, _depth: int = 0) -> str:
+    """The delimiter that splits this file's header row into the most columns.
+
+    csv.Sniffer guesses from a text sample and gets semicolon exports wrong often
+    enough to matter, and a wrong guess is indistinguishable from a one-column
+    file. The header row is the reliable evidence: parsed with csv.reader per
+    candidate, so a delimiter sitting inside a quoted value doesn't count. Comma
+    wins a tie, being the most common.
+    """
+    header = next((ln for ln in text.splitlines() if ln.strip()), "")
+    best, best_cols = ',', 0
+    for delim in CSV_DELIMITERS:
+        try:
+            cols = len(next(csv.reader([header], delimiter=delim)))
+        except (csv.Error, StopIteration):
+            continue
+        if cols > best_cols:
+            best, best_cols = delim, cols
+
+    # A double-encoded export hides its real delimiter inside one quoted field,
+    # where no candidate can see it. Peel that layer off and look again.
+    if best_cols <= 1 and _depth == 0:
+        try:
+            inner = next(csv.reader([header]))
+        except (csv.Error, StopIteration):
+            inner = []
+        if len(inner) == 1 and inner[0] != header:
+            return sniff_delimiter(inner[0], _depth=1)
+    return best
+
+
+def _unwrap_double_encoded_csv(text, sep=','):
     """Some exports wrap every row in an extra layer of CSV quoting, so each
     row parses as a single field whose content is itself a full CSV row.
     Detect that pattern, strip the outer layer, and return the rows already
     split into fields (as a list of lists) rather than reassembled text:
     the leading field of the inner row is sometimes left unquoted even when
-    it contains a literal comma, which a second blind CSV parse can't tell
+    it contains a literal separator, which a second blind CSV parse can't tell
     apart from an actual column boundary. Any such stray split is merged
     back into the leading field using the header's column count as the
-    source of truth."""
+    source of truth.
+
+    sep is the file's real delimiter. Without it every semicolon-separated file
+    matches the pattern - each line holds no comma, so it reads as one field -
+    and comes back as a single column."""
     lines = [ln for ln in text.splitlines() if ln.strip()]
     if len(lines) < 2:
         return None
     outer = []
     for ln in lines:
         try:
-            fields = next(csv.reader([ln]))
+            fields = next(csv.reader([ln], delimiter=sep))
         except csv.Error:
             return None
         if len(fields) != 1:
             return None
         outer.append(fields[0])
-    if not any(re.search(r'[,;]', u) for u in outer[:5]):
+    if not any(sep in u for u in outer[:5]):
         return None
-    rows = [next(csv.reader([u])) for u in outer]
+    rows = [next(csv.reader([u], delimiter=sep)) for u in outer]
     n_cols = len(rows[0])
+    if n_cols < 2:
+        # one column either way, so there was no extra layer to strip
+        return None
     for row in rows[1:]:
         while len(row) > n_cols:
-            row[0:2] = [row[0] + ',' + row[1]]
+            row[0:2] = [row[0] + sep + row[1]]
     return rows
 
 def read_file(f, nrows=None, sheet_name=0):
@@ -655,16 +722,13 @@ def read_file(f, nrows=None, sheet_name=0):
                 pass
         if text is None:
             text = raw.decode('latin-1', errors='replace')
-        rows = _unwrap_double_encoded_csv(text)
+        sep = sniff_delimiter(text)
+        rows = _unwrap_double_encoded_csv(text, sep)
         if rows is not None:
             df = pd.DataFrame(rows[1:], columns=rows[0])
             if nrows is not None:
                 df = df.head(nrows)
             return normalize_country_cols(df)
-        try:
-            sep = csv.Sniffer().sniff(text[:4096], delimiters=',;').delimiter
-        except csv.Error:
-            sep = ','
         return normalize_country_cols(pd.read_csv(io.StringIO(text), sep=sep, nrows=nrows))
     return normalize_country_cols(pd.read_excel(io.BytesIO(raw), nrows=nrows, sheet_name=sheet_name))
 
@@ -776,74 +840,68 @@ def find_symmetric_overlap(names_a: list, names_b: list, threshold: int) -> tupl
 
 
 def store_results(payload: dict) -> None:
-    previous_payload  = st.session_state.get(RESULTS_SESSION_KEY)
-    previous_moved    = list(st.session_state.get(MOVED_SESSION_KEY, []))
-    previous_rescued  = list(st.session_state.get(DUP_RESCUED_KEY, []))
+    previous_payload = st.session_state.get(RESULTS_SESSION_KEY)
+    previous_exempt  = list(st.session_state.get(DUP_EXEMPT_KEY, []))
     st.session_state[RESULTS_SESSION_KEY] = payload
-    if previous_payload and previous_payload.get("signature") == payload.get("signature"):
-        st.session_state[MOVED_SESSION_KEY] = previous_moved
-        st.session_state[DUP_RESCUED_KEY]   = previous_rescued
-    else:
-        st.session_state[MOVED_SESSION_KEY] = []
-        st.session_state[DUP_RESCUED_KEY]   = []
+    same_inputs = bool(previous_payload) and previous_payload.get("signature") == payload.get("signature")
+    st.session_state[DUP_EXEMPT_KEY] = previous_exempt if same_inputs else []
+    if not same_inputs:
+        st.session_state[DUPS_OPEN_KEY] = False
 
 
 def get_visible_results():
+    """The cached screening result, with the user's exemptions applied."""
     payload = st.session_state.get(RESULTS_SESSION_KEY)
     if not payload:
         return None
 
-    moved_ids = set(st.session_state.get(MOVED_SESSION_KEY, []))
-    promoted = [item for item in payload["matches"] if item["id"] in moved_ids]
-    remaining_matches = [item for item in payload["matches"] if item["id"] not in moved_ids]
+    exempt = set(st.session_state.get(DUP_EXEMPT_KEY, []))
 
-    internal_dups    = payload.get("internal_dups", [])
-    rescued_dup_ids  = set(st.session_state.get(DUP_RESCUED_KEY, []))
-    dup_ids          = {item["id_dup"] for item in internal_dups if item["id_dup"] not in rescued_dup_ids}
-    clean_unique     = [idx for idx in payload["unique_new"] if idx not in dup_ids]
-    rescued_indices  = [item["id_dup"] for item in internal_dups if item["id_dup"] in rescued_dup_ids]
-    unique_indices   = clean_unique + [item["id"] for item in promoted] + rescued_indices
+    # Rows with a usable company name: everything find_matches sorted into one
+    # bucket or the other. Rows whose name normalises to nothing are in neither.
+    usable = sorted(set(payload["unique_new"]) | {m["id"] for m in payload["matches"]})
+
+    name_flagged = ({m["id"] for m in payload["matches"]}
+                    | {d["id_dup"] for d in payload.get("internal_dups", [])}) - exempt
+    kept_ids = [i for i in usable if i not in name_flagged]
 
     return {
         "signature": payload["signature"],
-        "main_names": payload["main_names"],
         "new_names": payload["new_names"],
-        "matches": remaining_matches,
-        "promoted": promoted,
-        "unique_indices": unique_indices,
+        "matches": payload["matches"],
+        "internal_dups": payload.get("internal_dups", []),
+        "exempt": exempt,
+        "usable_ids": usable,
+        "kept_ids": kept_ids,
         "df_new_valid": payload["df_new_valid"],
-        "new_col": payload["new_col"],
-        "internal_dups": internal_dups,
-        "rescued_dup_ids": rescued_dup_ids,
+        "new_cols_by_file": payload.get("new_cols_by_file", {}),
+        # Carried through so the append step can rebuild the combined list on every
+        # rerun without re-reading (or re-screening) any file.
+        "main_col": payload.get("main_col"),
+        "screened": payload.get("screened", True),
+        "df_main": payload.get("df_main"),
+        "main_name": payload.get("main_name"),
+        "main_row_count": payload.get("main_row_count", 0),
     }
 
 
-def promote_match(match_id: int) -> None:
-    moved_ids = list(st.session_state.get(MOVED_SESSION_KEY, []))
-    if match_id not in moved_ids:
-        moved_ids.append(match_id)
-        st.session_state[MOVED_SESSION_KEY] = moved_ids
+# These run as on_click callbacks, i.e. before the script reruns, so everything
+# rendered below picks up the new state without a second forced rerun.
+def exempt_row(row_id) -> None:
+    """Force one row into the output, whichever check flagged it."""
+    ids = list(st.session_state.get(DUP_EXEMPT_KEY, []))
+    if row_id not in ids:
+        ids.append(row_id)
+        st.session_state[DUP_EXEMPT_KEY] = ids
+    st.session_state[DUPS_OPEN_KEY] = True
 
 
-def demote_match(match_id: int) -> None:
-    moved_ids = list(st.session_state.get(MOVED_SESSION_KEY, []))
-    if match_id in moved_ids:
-        moved_ids.remove(match_id)
-        st.session_state[MOVED_SESSION_KEY] = moved_ids
-
-
-def rescue_dup(dup_id: int) -> None:
-    rescued = list(st.session_state.get(DUP_RESCUED_KEY, []))
-    if dup_id not in rescued:
-        rescued.append(dup_id)
-        st.session_state[DUP_RESCUED_KEY] = rescued
-
-
-def unrescue_dup(dup_id: int) -> None:
-    rescued = list(st.session_state.get(DUP_RESCUED_KEY, []))
-    if dup_id in rescued:
-        rescued.remove(dup_id)
-        st.session_state[DUP_RESCUED_KEY] = rescued
+def unexempt_row(row_id) -> None:
+    ids = list(st.session_state.get(DUP_EXEMPT_KEY, []))
+    if row_id in ids:
+        ids.remove(row_id)
+        st.session_state[DUP_EXEMPT_KEY] = ids
+    st.session_state[DUPS_OPEN_KEY] = True
 
 
 APPEND_SKIP = "— Skip / leave empty —"
@@ -887,178 +945,204 @@ def _norm_emaildomain(val) -> str:
     return v
 
 
-def rescue_append_row(main_name: str, row_id: str) -> None:
-    rescued = {k: set(v) for k, v in st.session_state.get(APPEND_RESCUED_KEY, {}).items()}
-    rescued.setdefault(main_name, set()).add(row_id)
-    st.session_state[APPEND_RESCUED_KEY] = rescued
+SRC_FILE_COL = "_src_file"
+SRC_ROW_COL  = "_src_row"
+# Each list names its company column whatever it likes, so the chosen one is
+# copied here as well: screening then has a single column to work across files.
+NAME_COL     = "_company"
+BOOKKEEPING_COLS = (SRC_FILE_COL, SRC_ROW_COL, NAME_COL)
+
+MAIN_LIST_ORIGIN = None   # a finding whose origin is None collided with the main list
 
 
-def unrescue_append_row(main_name: str, row_id: str) -> None:
-    rescued = {k: set(v) for k, v in st.session_state.get(APPEND_RESCUED_KEY, {}).items()}
-    rescued.setdefault(main_name, set()).discard(row_id)
-    st.session_state[APPEND_RESCUED_KEY] = rescued
+def _key_kind(col_name: str) -> str:
+    """How the values in one main-list column identify a company."""
+    k = col_key(col_name)
+    if _is_emaildomain_col(col_name):
+        return "domain"
+    if "email" in k or k == "mail":
+        return "email"
+    if _is_website_col(col_name):
+        return "website"
+    if "linkedin" in k:
+        return "url"
+    return "text"
 
 
-def compute_append_payload(main_name, main_file, main_sheet, mappings, email_col, new_files, sheets_map, ranges_map):
+def default_key_cols(main_columns) -> list:
+    """Columns that identify a company on their own, so they make good keys."""
+    return [c for c in main_columns if _key_kind(c) in ("domain", "email", "website", "url")]
+
+
+def match_key(col_name, val, kind=None) -> str:
+    """Normalise one cell into a comparison key, or "" when it identifies nothing.
+
+    Compared in the same shape it is written in: an email-domain column ignores
+    the part before the @, websites and profile urls ignore scheme and www. A
+    plain email column keeps the full address, otherwise two contacts at one
+    company would count as the same company.
     """
-    Map every file's rows onto the main list's columns and flag duplicate emails
-    without dropping anything yet — the caller decides what stays out based on
-    which flagged rows the user has since rescued.
-    Returns {main_name, df_main, mapped_rows, skip_map}.
-    mapped_rows carries two bookkeeping columns, "_row_id" and "_source_file",
-    which the renderer strips before the final concat.
-    skip_map: {row_id: {reason, email, comparison, label, row_num, file}}
-    """
-    main_file.seek(0)
-    df_main = read_file(main_file, sheet_name=main_sheet)
-    main_name_col = detect_company_col(df_main.columns.tolist())
+    if not pd.notna(val):
+        return ""
+    text = str(val).strip()
+    if not text:
+        return ""
+    kind = kind or _key_kind(col_name)
+    if kind == "domain":
+        text = str(_norm_emaildomain(text) or text)
+    elif kind in ("website", "url"):
+        text = text.split("://", 1)[-1]
+        if text.lower().startswith("www."):
+            text = text[4:]
+        text = text.split("?")[0].split("#")[0].rstrip("/")
+    return text.strip().lower()
 
-    # email -> display label, seeded from the main list, then extended with
-    # every newly-kept row so later files also dedupe against earlier ones.
-    existing_email_map = {}
-    if email_col and email_col in df_main.columns:
-        for _, r in df_main.dropna(subset=[email_col]).iterrows():
-            key = str(r[email_col]).strip().lower()
-            if key and key not in existing_email_map:
-                label = r.get(main_name_col)
-                existing_email_map[key] = str(label).strip() if pd.notna(label) else key
+
+def name_findings(payload, exempt) -> list:
+    """The fuzzy company-name duplicates, as findings.
+
+    Cached with the screening result, because matching every new name against the
+    whole main list is the expensive part of the run.
+    """
+    out = []
+    for m in payload.get("matches", []):
+        out.append({
+            "row_id": m["id"], "kind": "name", "key": "company name",
+            "score": m["score"], "row_label": m["raw_name"],
+            "match_label": m["matched_main_name"], "match_origin": MAIN_LIST_ORIGIN,
+            "value": m["raw_name"], "exempt": m["id"] in exempt,
+        })
+    for d in payload.get("internal_dups", []):
+        out.append({
+            "row_id": d["id_dup"], "kind": "name", "key": "company name",
+            "score": d["score"], "row_label": d["name_dup"],
+            "match_label": d["name_keeper"], "match_origin": "an earlier new row",
+            "value": d["name_dup"], "exempt": d["id_dup"] in exempt,
+        })
+    return out
+
+
+def build_combined(df_main, main_name_col, mappings, key_cols, sources, exempt):
+    """Map the surviving rows onto the main list's columns and drop the ones whose
+    identity keys already exist, either in the main list or in a row already kept.
+
+    mappings – {source file: {main_col: source_col | APPEND_SKIP}}
+    key_cols – main-list columns to compare on, in the order given
+    sources  – [(source file, rows)] indexed by their position in df_new_valid
+    exempt   – row ids the user forced in; they are appended and their keys are
+               registered, so a later duplicate still collides with them
+
+    Returns {df_result, appended, findings}, findings sharing the shape used by
+    name_findings so both kinds can be reviewed as one list.
+    """
+    key_cols = [c for c in key_cols if c in df_main.columns]
+    kinds    = {c: _key_kind(c) for c in key_cols}
+
+    # key value -> (label, origin); origin None means the main list
+    index = {c: {} for c in key_cols}
+    _labels = df_main[main_name_col] if main_name_col in df_main.columns else None
+    for c in key_cols:
+        for val, label in zip(df_main[c], _labels if _labels is not None else df_main[c]):
+            k = match_key(c, val, kinds[c])
+            if k and k not in index[c]:
+                index[c][k] = (str(label).strip() if pd.notna(label) else k, MAIN_LIST_ORIGIN)
 
     mapped_chunks = []
-    skip_map = {}
-
-    for ap_file in new_files:
-        if ap_file.name not in mappings:
+    for src_name, df_src in sources:
+        file_mapping = mappings.get(src_name)
+        if not file_mapping or not len(df_src):
             continue
-        ap_file.seek(0)
-        df_ap_new = read_file(ap_file, sheet_name=sheets_map.get(ap_file.name, 0))
-        file_mapping = mappings[ap_file.name]
-        from_r, to_r = ranges_map.get(ap_file.name, (1, len(df_ap_new)))
-        df_slice = df_ap_new.iloc[from_r - 1:to_r].reset_index(drop=True)
-
-        email_source = file_mapping.get(email_col, APPEND_SKIP) if email_col else APPEND_SKIP
-        name_source  = file_mapping.get(main_name_col, APPEND_SKIP)
-
-        row_ids = [f"{main_name}||{ap_file.name}||{from_r + i}" for i in range(len(df_slice))]
-        mapped_full = pd.DataFrame({
-            mc: (df_slice[src].values if src != APPEND_SKIP and src in df_slice.columns
-                 else [None] * len(df_slice))
-            for mc, src in file_mapping.items()
-        })
-        mapped_full["_row_id"]      = row_ids
-        mapped_full["_source_file"] = ap_file.name
-
-        if email_col and email_source != APPEND_SKIP and email_source in df_slice.columns:
-            seen_in_batch = {}
-            for i in range(len(df_slice)):
-                val = df_slice[email_source].iloc[i]
-                key = str(val).strip().lower() if pd.notna(val) else ""
-                if not key:
-                    continue
-                label = None
-                if name_source != APPEND_SKIP and name_source in df_slice.columns:
-                    nv = df_slice[name_source].iloc[i]
-                    if pd.notna(nv) and str(nv).strip():
-                        label = str(nv).strip()
-                if key in existing_email_map:
-                    skip_map[row_ids[i]] = {
-                        "reason": "existing", "email": val,
-                        "comparison": existing_email_map[key],
-                        "label": label or key, "row_num": from_r + i, "file": ap_file.name,
-                    }
-                elif key in seen_in_batch:
-                    skip_map[row_ids[i]] = {
-                        "reason": "internal", "email": val,
-                        "comparison": seen_in_batch[key],
-                        "label": label or key, "row_num": from_r + i, "file": ap_file.name,
-                    }
-                else:
-                    seen_in_batch[key] = label or key
-            # Fold this file's unique emails into the cross-file map only now —
-            # doing it inline above would make same-file dupes match "existing"
-            # (checked first) instead of "internal" before they're ever compared.
-            existing_email_map.update(seen_in_batch)
-
-        for col in mapped_full.columns:
-            if col in ("_row_id", "_source_file"):
-                continue
+        chunk = pd.DataFrame(
+            {mc: (df_src[src].values if src != APPEND_SKIP and src in df_src.columns
+                  else [None] * len(df_src))
+             for mc, src in file_mapping.items()},
+            index=df_src.index,
+        )
+        for col in chunk.columns:
             if _is_website_col(col):
-                mapped_full[col] = mapped_full[col].apply(_norm_website)
+                chunk[col] = chunk[col].apply(_norm_website)
             elif _is_emaildomain_col(col):
-                mapped_full[col] = mapped_full[col].apply(_norm_emaildomain)
+                chunk[col] = chunk[col].apply(_norm_emaildomain)
+        chunk["_source_file"] = src_name
+        chunk["_source_row"]  = (df_src[SRC_ROW_COL].values if SRC_ROW_COL in df_src.columns
+                                 else range(1, len(df_src) + 1))
+        mapped_chunks.append(chunk)
 
-        mapped_chunks.append(mapped_full)
+    if not mapped_chunks:
+        return {"df_result": df_main.copy(), "appended": df_main.iloc[0:0].copy(), "findings": []}
 
-    mapped_rows = pd.concat(mapped_chunks, ignore_index=True) if mapped_chunks else pd.DataFrame()
+    mapped = pd.concat(mapped_chunks)
+    findings, keep_ids = [], []
 
-    return {
-        "main_name":   main_name,
-        "df_main":     df_main,
-        "mapped_rows": mapped_rows,
-        "skip_map":    skip_map,
-    }
+    for row_id, row in mapped.iterrows():
+        is_exempt = row_id in exempt
+        hit = None
+        # Evaluated for forced-in rows too, so the review list can still show what
+        # they collided with - and offer to un-force them.
+        for c in key_cols:
+            k = match_key(c, row.get(c), kinds[c])
+            if k and k in index[c]:
+                label, origin = index[c][k]
+                hit = {
+                    "row_id": row_id, "kind": "key", "key": c,
+                    "score": None,
+                    "row_label": (str(row.get(main_name_col)).strip()
+                                  if pd.notna(row.get(main_name_col)) else k),
+                    "match_label": label, "match_origin": origin,
+                    "value": k, "exempt": is_exempt,
+                    "file": row["_source_file"], "row_num": row["_source_row"],
+                }
+                break
+        if hit:
+            findings.append(hit)
+            if not is_exempt:
+                continue
+        keep_ids.append(row_id)
+        # a kept row becomes something later rows can collide with
+        for c in key_cols:
+            k = match_key(c, row.get(c), kinds[c])
+            if k and k not in index[c]:
+                label = row.get(main_name_col)
+                index[c][k] = (str(label).strip() if pd.notna(label) else k, row["_source_file"])
+
+    appended = mapped.loc[keep_ids].drop(columns=["_source_file", "_source_row"])
+    appended = appended.reindex(columns=[c for c in df_main.columns if c in appended.columns])
+    df_result = (pd.concat([df_main, appended], ignore_index=True) if len(appended)
+                 else df_main.copy())
+
+    return {"df_result": df_result, "appended": appended, "findings": findings}
 
 
-def render_append_payload(payload):
-    """Render one main list's append result, applying the current rescue state,
-    and return the final combined DataFrame for download."""
-    main_name   = payload["main_name"]
-    df_main     = payload["df_main"]
-    mapped_rows = payload["mapped_rows"]
-    skip_map    = payload["skip_map"]
-
-    rescued         = st.session_state.get(APPEND_RESCUED_KEY, {}).get(main_name, set())
-    active_skip_ids = {rid for rid in skip_map if rid not in rescued}
-
-    if len(mapped_rows):
-        keep_mask = ~mapped_rows["_row_id"].isin(active_skip_ids)
-        kept_rows = mapped_rows[keep_mask].drop(columns=["_row_id", "_source_file"]).reset_index(drop=True)
-    else:
-        kept_rows = mapped_rows
-
-    df_result     = pd.concat([df_main, kept_rows], ignore_index=True) if len(kept_rows) else df_main.copy()
-    original_rows = len(df_main)
-    appended_rows = len(kept_rows)
-    skipped_count = len(active_skip_ids)
-
-    st.markdown(f'<div class="section-header">&#9632;&nbsp; Result — {main_name}</div>', unsafe_allow_html=True)
-    stat_cols = st.columns(4 if skip_map else 3, gap="small")
-    stat_cols[0].markdown(f'<div class="stat-box"><div class="stat-num">{original_rows:,}</div><div class="stat-label">Main rows</div></div>', unsafe_allow_html=True)
-    stat_cols[1].markdown(f'<div class="stat-box"><div class="stat-num">{appended_rows:,}</div><div class="stat-label">Appended rows</div></div>', unsafe_allow_html=True)
-    if skip_map:
-        stat_cols[2].markdown(f'<div class="stat-box"><div class="stat-num warn">{skipped_count:,}</div><div class="stat-label">Skipped (email)</div></div>', unsafe_allow_html=True)
-    stat_cols[-1].markdown(f'<div class="stat-box"><div class="stat-num">{len(df_result):,}</div><div class="stat-label">Total rows</div></div>', unsafe_allow_html=True)
-
-    st.markdown("")
-    st.dataframe(kept_rows.head(200), use_container_width=True, hide_index=True)
-    if len(kept_rows) > 200:
-        st.markdown(f"<small style='color:#3a4a5e'>Showing first 200 of {len(kept_rows):,} new rows.</small>", unsafe_allow_html=True)
-
-    if skip_map:
-        st.markdown("")
-        st.markdown('<div class="section-header">&#9664;&#9654;&nbsp; Skipped rows (duplicate email)</div>', unsafe_allow_html=True)
-        st.markdown("<small style='color:#3a4a5e'>These rows were left out because their email already exists. Click <strong>Include anyway</strong> if it's not actually a duplicate.</small>", unsafe_allow_html=True)
-        st.markdown("")
-        for rid, info in sorted(skip_map.items(), key=lambda kv: kv[1]["row_num"]):
-            is_rescued = rid in rescued
-            row_l, row_r = st.columns([0.82, 0.18])
-            reason_txt = "already in main list" if info["reason"] == "existing" else "duplicate within this file"
-            with row_l:
-                st.markdown(f"""
-                <div class="match-card" style="{'opacity:0.45' if is_rescued else ''}">
-                  <span class="match-names"><span class="match-main">{info['label']}</span><span class="match-arrow"> {reason_txt} &mdash; </span>{info['comparison']} <span style="color:var(--tx-lo)">({info['email']})</span></span>
-                  <span class="match-score">{info['file']} &middot; row {info['row_num']}</span>
-                </div>""", unsafe_allow_html=True)
-            with row_r:
-                if is_rescued:
-                    if st.button("Remove", key=f"unrescue_ap_{main_name}_{rid}", type="secondary"):
-                        unrescue_append_row(main_name, rid)
-                        st.rerun()
-                else:
-                    if st.button("Include anyway", key=f"rescue_ap_{main_name}_{rid}", type="secondary"):
-                        rescue_append_row(main_name, rid)
-                        st.rerun()
-
-    return df_result
+def render_column_mapping(title, main_columns, new_columns, key_prefix, preselect=None):
+    """One "main list column <- column from this file" mapping block.
+    preselect: {main_col: source_col} defaults that win over name auto-matching —
+    used for the company column, which the user has already paired up in step 03.
+    Returns {main_col: source_col | APPEND_SKIP}."""
+    options = [APPEND_SKIP] + new_columns
+    st.markdown(f"<small style='color:#3a4a5e;font-family:JetBrains Mono,monospace;text-transform:uppercase;letter-spacing:0.08em'>&#9654;&nbsp; {title}</small>", unsafe_allow_html=True)
+    hdr_l, hdr_r = st.columns([1, 2])
+    with hdr_l:
+        st.markdown("<small style='color:#2a3a4e;font-family:JetBrains Mono,monospace'>Main list column</small>", unsafe_allow_html=True)
+    with hdr_r:
+        st.markdown("<small style='color:#2a3a4e;font-family:JetBrains Mono,monospace'>Column from this file</small>", unsafe_allow_html=True)
+    mapping = {}
+    for mc in main_columns:
+        forced      = (preselect or {}).get(mc)
+        auto_match  = (forced if forced in new_columns
+                       else next((c for c in new_columns if col_key(c) == col_key(mc)), None))
+        default_idx = new_columns.index(auto_match) + 1 if auto_match else 0
+        map_l, map_r = st.columns([1, 2])
+        with map_l:
+            st.markdown(f"<div style='padding:0.45rem 0;font-family:JetBrains Mono,monospace;font-size:0.8rem;color:#c9d1e0'>{mc}</div>", unsafe_allow_html=True)
+        with map_r:
+            mapping[mc] = st.selectbox(
+                mc,
+                options,
+                index=default_idx,
+                key=f"{key_prefix}_{mc}_{forced}" if forced else f"{key_prefix}_{mc}",
+                label_visibility="collapsed",
+            )
+    return mapping
 
 
 # ── UI ────────────────────────────────────────────────────────────────────────
@@ -1075,24 +1159,27 @@ with _hcol_btn:
 
 st.markdown("<div style='margin-bottom:0.2rem'></div>", unsafe_allow_html=True)
 
-tab1, tab2, tab3 = st.tabs(["  Unique Rows Finder  ", "  List Appender  ", "  List Diff  "])
+tab1, tab2 = st.tabs(["  Screen & Append  ", "  List Diff  "])
 
-# ── Tab 1: Unique Rows Finder ───────────────────────────────────────────────────
+# ── Tab 1: Screen & Append ────────────────────────────────────────────────────
 with tab1:
 
     st.markdown("""
 <div class="tab-desc">
-  <strong>Unique Rows Finder</strong> — upload your main database and a new list, then
-  run a fuzzy company-name match to flag entries that already exist. Move confirmed
-  matches out, keep clean records in.
+  <strong>Screen &amp; Append</strong> — upload your main list and the new lists once.
+  A fuzzy company-name match flags what already exists, and everything that survives
+  is mapped straight onto the main list's columns. Review the name matches, in-list
+  duplicates and duplicate emails, then download the combined list — no intermediate
+  download and re-upload.
 </div>""", unsafe_allow_html=True)
 
     # ── Upload ─────────────────────────────────────────────────────────────────
     col_a, col_b = st.columns(2, gap="medium")
 
     with col_a:
-        st.markdown('<div class="upload-label">&#9632;&nbsp; 01 &mdash; Main database</div>', unsafe_allow_html=True)
-        main_file = st.file_uploader("Main database", type=["xlsx", "xls", "csv"], key="main",
+        st.markdown('<div class="upload-label">&#9632;&nbsp; 01 &mdash; Main list</div>', unsafe_allow_html=True)
+        st.markdown("<small style='color:#3a4a5e'>Screened against <em>and</em> appended to.</small>", unsafe_allow_html=True)
+        main_file = st.file_uploader("Main list", type=["xlsx", "xls", "csv"], key="main",
                                       label_visibility="collapsed")
         if isinstance(main_file, list):
             if len(main_file) > 1:
@@ -1100,137 +1187,249 @@ with tab1:
             main_file = main_file[0] if main_file else None
 
     with col_b:
-        st.markdown('<div class="upload-label">&#9632;&nbsp; 02 &mdash; New companies</div>', unsafe_allow_html=True)
-        new_files = st.file_uploader("New companies to check", type=["xlsx", "xls", "csv"], key="new",
+        st.markdown('<div class="upload-label">&#9632;&nbsp; 02 &mdash; New lists</div>', unsafe_allow_html=True)
+        st.markdown("<small style='color:#3a4a5e'>Screened, then appended.</small>", unsafe_allow_html=True)
+        new_files = st.file_uploader("New lists to screen and append", type=["xlsx", "xls", "csv"], key="new",
                                       accept_multiple_files=True, label_visibility="collapsed")
         if not isinstance(new_files, list):
             new_files = [new_files] if new_files else []
-        new_file = new_files[0] if new_files else None
 
     st.markdown("")
 
     # ── Sheet selection (Excel only) ────────────────────────────────────────────
     main_sheet = 0
-    new_sheet  = 0
+    new_sheets = {}   # {filename: sheet_name}
 
+    _sheet_picks = []   # (label, sheets, widget_key, target, filename)
     if main_file and not main_file.name.lower().endswith('.csv'):
         _ms = get_excel_sheets(main_file)
         if _ms:
-            main_sheet = st.selectbox("Sheet — Main database", _ms, key="main_sheet")
-            st.markdown("")
+            _sheet_picks.append(("Sheet — Main list", _ms, "main_sheet", "main", None))
+    for _nf in new_files:
+        if not _nf.name.lower().endswith('.csv'):
+            _nfs = get_excel_sheets(_nf)
+            if _nfs:
+                _sheet_picks.append((f"Sheet — {_nf.name}", _nfs, f"sa_sheet_{_nf.name}", "new", _nf.name))
 
-    if new_file and not new_file.name.lower().endswith('.csv'):
-        _ns = get_excel_sheets(new_file)
-        if _ns:
-            new_sheet = st.selectbox("Sheet — New companies", _ns, key="new_sheet")
-            st.markdown("")
+    if _sheet_picks:
+        for _i in range(0, len(_sheet_picks), 3):
+            _row = _sheet_picks[_i:_i + 3]
+            _sc  = st.columns(len(_row), gap="small")
+            for _c, (_lbl, _sheets, _key, _target, _fname) in zip(_sc, _row):
+                with _c:
+                    _sel = st.selectbox(_lbl, _sheets, key=_key)
+                    if _target == "main":
+                        main_sheet = _sel
+                    else:
+                        new_sheets[_fname] = _sel
+        st.markdown("")
 
-    # ── Column selection ────────────────────────────────────────────────────────
-    main_col_choice    = None
-    new_col_choice     = None
-    output_col_choices = None
+    # ── Read the column names of everything uploaded ────────────────────────────
+    main_cols    = []
+    new_cols_map = {}   # {filename: [columns]}
 
-    if main_file and new_files:
-        if len(new_files) > 1:
-            st.info(f"{len(new_files)} files will be combined and screened together. Column configuration is based on the first file.")
+    if main_file:
         try:
-            main_cols = read_file(main_file, nrows=0, sheet_name=main_sheet).columns.tolist()
-            new_cols  = read_file(new_files[0], nrows=0, sheet_name=new_sheet).columns.tolist()
             main_file.seek(0)
-            for _nf in new_files:
-                _nf.seek(0)
-
-            st.markdown('<div class="section-header">&#9632;&nbsp; 03 &mdash; Column to compare</div>', unsafe_allow_html=True)
-            col_sel_a, col_sel_b = st.columns(2, gap="medium")
-            with col_sel_a:
-                default_main = detect_company_col(main_cols)
-                main_col_choice = st.selectbox(
-                    "Main database — company column",
-                    main_cols,
-                    index=main_cols.index(default_main),
-                )
-            with col_sel_b:
-                default_new = detect_company_col(new_cols)
-                new_col_choice = st.selectbox(
-                    "New list — company column",
-                    new_cols,
-                    index=new_cols.index(default_new),
-                )
-
-            st.markdown("")
-            st.markdown('<div class="section-header">&#9632;&nbsp; 04 &mdash; Output columns</div>', unsafe_allow_html=True)
-            output_col_choices = st.multiselect(
-                "Columns from the new list to include in the output",
-                new_cols,
-                default=[new_col_choice],
-            )
-            st.markdown("")
+            main_cols = read_file(main_file, nrows=0, sheet_name=main_sheet).columns.tolist()
+            main_file.seek(0)
         except Exception:
-            pass
+            st.warning(f"Could not read columns from {main_file.name}.")
+    for _nf in new_files:
+        try:
+            _nf.seek(0)
+            new_cols_map[_nf.name] = read_file(_nf, nrows=0, sheet_name=new_sheets.get(_nf.name, 0)).columns.tolist()
+            _nf.seek(0)
+        except Exception:
+            new_cols_map[_nf.name] = []
 
-    st.markdown('<div class="section-header">&#9632;&nbsp; 05 &mdash; Match sensitivity</div>', unsafe_allow_html=True)
+    # Every column offered by any new list, in first-file-first order.
+    new_cols_union = []
+    for _nf in new_files:
+        for _c in new_cols_map.get(_nf.name, []):
+            if _c not in new_cols_union and _c not in BOOKKEEPING_COLS:
+                new_cols_union.append(_c)
 
-    thresh_col, hint_col = st.columns([3, 1])
-    with thresh_col:
-        threshold = st.slider(
-            "Match threshold",
-            min_value=50, max_value=100, value=70,
-            help="Lower = catches more variations. 70 is a good default.",
-            label_visibility="collapsed"
+    # ── Screening settings ──────────────────────────────────────────────────────
+    do_screening      = True
+    main_col_choice   = None
+    new_col_choices   = {}   # {filename: that file's company column}
+    threshold         = 70
+
+    if main_cols and new_cols_union:
+        st.markdown('<div class="section-header">&#9632;&nbsp; 03 &mdash; Columns to compare</div>', unsafe_allow_html=True)
+        do_screening = st.checkbox(
+            "Screen the new rows against the main list (fuzzy company-name match)",
+            value=True,
+            key="sa_do_screen",
+            help="Uncheck to append everything without name screening — the email duplicate check still runs.",
         )
-    with hint_col:
-        st.markdown(f"<div style='font-family:JetBrains Mono,monospace;font-size:1.4rem;font-weight:700;color:#00ff88;text-align:center;padding-top:0.3rem'>{threshold}<span style='font-size:0.7rem;color:#3a4a5e;margin-left:2px'>/ 100</span></div>", unsafe_allow_html=True)
 
-    st.markdown(f"<small style='color:#2a3a4e'>Scores &ge; {threshold} are flagged as matches &nbsp;&mdash;&nbsp; lower threshold catches more variations like <em>Acme Corp</em> vs <em>Acme Corporation</em></small>", unsafe_allow_html=True)
-    st.markdown("")
+        if do_screening:
+            st.markdown("<small style='color:#3a4a5e'>The company column is picked per list, so the new lists do not have to name it the same way.</small>", unsafe_allow_html=True)
+            st.markdown("")
 
-    run = st.button("&#9889;  Run Screening", type="primary", use_container_width=True)
+            # main list first, then one picker per new list, laid out two per row
+            _pickers = [("Main list — company column", main_cols, None)]
+            for _nf in new_files:
+                _fcols = [c for c in new_cols_map.get(_nf.name, []) if c not in BOOKKEEPING_COLS]
+                if _fcols:
+                    _pickers.append((f"{_nf.name} — company column", _fcols, _nf.name))
+
+            for _i in range(0, len(_pickers), 2):
+                _pair = _pickers[_i:_i + 2]
+                _pc = st.columns(2, gap="medium")
+                for _c, (_lbl, _opts, _fname) in zip(_pc, _pair):
+                    with _c:
+                        _default = detect_company_col(_opts)
+                        _pick = st.selectbox(_lbl, _opts, index=_opts.index(_default))
+                        if _fname is None:
+                            main_col_choice = _pick
+                        else:
+                            new_col_choices[_fname] = _pick
+
+            if len(new_files) > 1:
+                st.info(f"{len(new_files)} files are screened together — against the main list and against each other — then each file's rows are mapped with its own mapping below.")
+
+            st.markdown("")
+            st.markdown('<div class="section-header">&#9632;&nbsp; 04 &mdash; Match sensitivity</div>', unsafe_allow_html=True)
+            thresh_col, hint_col = st.columns([3, 1])
+            with thresh_col:
+                threshold = st.slider(
+                    "Match threshold",
+                    min_value=50, max_value=100, value=70,
+                    help="Lower = catches more variations. 70 is a good default.",
+                    label_visibility="collapsed",
+                    key="sa_threshold",
+                )
+            with hint_col:
+                st.markdown(f"<div style='font-family:JetBrains Mono,monospace;font-size:1.4rem;font-weight:700;color:#00ff88;text-align:center;padding-top:0.3rem'>{threshold}<span style='font-size:0.7rem;color:#3a4a5e;margin-left:2px'>/ 100</span></div>", unsafe_allow_html=True)
+            st.markdown(f"<small style='color:#2a3a4e'>Scores &ge; {threshold} are flagged as matches &nbsp;&mdash;&nbsp; lower threshold catches more variations like <em>Acme Corp</em> vs <em>Acme Corporation</em></small>", unsafe_allow_html=True)
+
+        st.markdown("")
+
+    # ── Per-file column mapping ─────────────────────────────────────────────────
+    mappings  = {}   # {filename: {main_col: source_col | APPEND_SKIP}}
+    key_cols  = []
+
+    if main_cols and new_files:
+        st.markdown('<div class="section-header">&#9632;&nbsp; 05 &mdash; Column mapping</div>', unsafe_allow_html=True)
+        st.markdown("<small style='color:#3a4a5e'>For every column in the main list, pick the matching column from the new list — or skip it. Identically named columns are matched automatically.</small>", unsafe_allow_html=True)
+        st.markdown("")
+
+        for _nf in new_files:
+            _ncols = [c for c in new_cols_map.get(_nf.name, []) if c not in BOOKKEEPING_COLS]
+            with st.expander(f"**{_nf.name}**", expanded=len(new_files) == 1):
+                if not _ncols:
+                    st.warning(f"Could not read columns from {_nf.name}.")
+                    continue
+
+                _preselect = ({main_col_choice: new_col_choices[_nf.name]}
+                              if main_col_choice and new_col_choices.get(_nf.name) else None)
+                mappings[_nf.name] = render_column_mapping(
+                    f"Mapping to {main_file.name}", main_cols, _ncols, f"sa_map_{_nf.name}",
+                    preselect=_preselect,
+                )
+
+        # ── Identity keys ───────────────────────────────────────────────────────
+        st.markdown("")
+        st.markdown('<div class="section-header">&#9632;&nbsp; 06 &mdash; Duplicate keys</div>', unsafe_allow_html=True)
+        st.markdown("<small style='color:#3a4a5e'>Besides the company name, treat these main-list columns as identity: a new row whose value is already present is a duplicate. Email-domain columns ignore anything before the @, and websites and profile links ignore http/https, www and trailing paths.</small>", unsafe_allow_html=True)
+        key_cols = st.multiselect(
+            "Columns that identify a company",
+            main_cols,
+            default=default_key_cols(main_cols),
+            label_visibility="collapsed",
+        )
+        if not key_cols:
+            st.markdown("<small style='color:#3a4a5e'>No identity keys selected &mdash; only the company name is compared.</small>", unsafe_allow_html=True)
+        st.markdown("")
+
+    # ── Run ─────────────────────────────────────────────────────────────────────
+    def _current_signature():
+        """What a stored result was computed from — used both to reset the review
+        state on a genuinely new run and to warn when the inputs have moved on."""
+        return {
+            "main_file":  getattr(main_file, "name", ""),
+            "main_size":  getattr(main_file, "size", None),
+            "new_files":  [getattr(f, "name", "") for f in new_files],
+            "new_size":   sum(getattr(f, "size", 0) for f in new_files),
+            "threshold":  threshold if do_screening else None,
+            "screened":   do_screening,
+            "main_col":   main_col_choice,
+            "new_cols":   new_col_choices,
+            "key_cols":   list(key_cols),
+        }
+
+    run = st.button("&#9889;  Run &mdash; Screen &amp; Append", type="primary", use_container_width=True)
 
     if run:
         if not main_file or not new_files:
-            st.error("Please upload both files before running.")
+            st.error("Please upload the main list and at least one new list before running.")
+        elif not mappings:
+            st.error("Column mapping could not be determined. Check your files.")
         else:
             try:
                 with st.spinner("Reading files…"):
+                    main_file.seek(0)
                     df_main = read_file(main_file, sheet_name=main_sheet)
-                    if len(new_files) == 1:
-                        df_new = read_file(new_files[0], sheet_name=new_sheet)
-                    else:
-                        _dfs_new = []
-                        for _i, _nf in enumerate(new_files):
-                            _nf.seek(0)
-                            _dfs_new.append(read_file(_nf, sheet_name=new_sheet if _i == 0 else 0))
-                        df_new = pd.concat(_dfs_new, ignore_index=True)
+
+                    _dfs_new = []
+                    new_cols_by_file = {}   # {filename: the company column it was screened on}
+                    for _nf in new_files:
+                        _nf.seek(0)
+                        _d = read_file(_nf, sheet_name=new_sheets.get(_nf.name, 0))
+                        _d[SRC_FILE_COL] = _nf.name
+                        _d[SRC_ROW_COL]  = list(range(1, len(_d) + 1))
+                        _ccol = new_col_choices.get(_nf.name)
+                        if _ccol is None:
+                            _ccol = detect_company_col([c for c in _d.columns if c not in BOOKKEEPING_COLS])
+                        new_cols_by_file[_nf.name] = _ccol
+                        _d[NAME_COL] = _d[_ccol] if _ccol in _d.columns else None
+                        _dfs_new.append(_d)
+                    df_new = pd.concat(_dfs_new, ignore_index=True) if len(_dfs_new) > 1 else _dfs_new[0]
 
                 main_col = main_col_choice or detect_company_col(df_main.columns.tolist())
-                new_col  = new_col_choice  or detect_company_col(df_new.columns.tolist())
 
-                main_names   = df_main[main_col].dropna().astype(str).tolist()
-                df_new_valid = df_new.dropna(subset=[new_col]).reset_index(drop=True)
-                new_names    = df_new_valid[new_col].astype(str).tolist()
+                if do_screening:
+                    main_names   = df_main[main_col].dropna().astype(str).tolist()
+                    df_new_valid = df_new.dropna(subset=[NAME_COL]).reset_index(drop=True)
+                    new_names    = df_new_valid[NAME_COL].astype(str).tolist()
 
-                with st.spinner("Screening against main database…"):
-                    matches, unique_new = find_matches(main_names, new_names, threshold)
+                    with st.spinner("Screening against the main list…"):
+                        matches, unique_new = find_matches(main_names, new_names, threshold)
 
-                with st.spinner("Checking for within-list duplicates…"):
-                    internal_dups = find_internal_duplicates(new_names, threshold)
+                    with st.spinner("Checking for duplicates within the new lists…"):
+                        internal_dups = find_internal_duplicates(new_names, threshold)
+                else:
+                    main_names    = []
+                    df_new_valid  = df_new.reset_index(drop=True)
+                    new_names     = (df_new_valid[NAME_COL].astype(str).tolist()
+                                     if NAME_COL in df_new_valid.columns else [""] * len(df_new_valid))
+                    matches       = []
+                    unique_new    = list(range(len(df_new_valid)))
+                    internal_dups = []
+
+                _sig      = _current_signature()
+                _prev_sig = (st.session_state.get(RESULTS_SESSION_KEY) or {}).get("signature")
 
                 store_results({
-                    "signature": {
-                        "main_file": getattr(main_file, "name", ""),
-                        "main_size": getattr(main_file, "size", None),
-                        "new_file": new_files[0].name if new_files else "",
-                        "new_size": sum(getattr(_nf, "size", 0) for _nf in new_files),
-                        "threshold": threshold,
-                    },
-                    "main_names": main_names,
-                    "new_names": new_names,
-                    "matches": matches,
-                    "unique_new": unique_new,
-                    "internal_dups": internal_dups,
-                    "df_new_valid": df_new_valid,
-                    "new_col": new_col,
+                    "signature":      _sig,
+                    "main_names":     main_names,
+                    "new_names":      new_names,
+                    "matches":        matches,
+                    "unique_new":     unique_new,
+                    "internal_dups":  internal_dups,
+                    "df_new_valid":   df_new_valid,
+                    "new_cols_by_file": new_cols_by_file,
+                    "main_col":       main_col,
+                    "screened":       do_screening,
+                    "df_main":        df_main,
+                    "main_name":      main_file.name,
+                    "main_row_count": len(df_main),
                 })
+
+                # store_results clears the exemptions itself when the inputs move on
 
             except Exception as e:
                 st.error(f"Something went wrong: {e}")
@@ -1239,434 +1438,156 @@ with tab1:
     visible_results = get_visible_results()
 
     if visible_results:
-        remaining_matches = visible_results["matches"]
-        promoted          = visible_results["promoted"]
-        unique_indices    = visible_results["unique_indices"]
+        was_screened      = visible_results.get("screened", True)
         df_new_valid      = visible_results["df_new_valid"]
-        new_col           = visible_results["new_col"]
-        internal_dups     = visible_results.get("internal_dups", [])
-        rescued_dup_ids   = visible_results.get("rescued_dup_ids", set())
+        new_cols_by_file  = visible_results.get("new_cols_by_file", {})
+        exempt            = visible_results["exempt"]
+        df_main_p         = visible_results.get("df_main")
+        main_col_p        = visible_results.get("main_col")
+        main_name_p       = visible_results.get("main_name") or "main list"
 
-        st.markdown('<div class="section-header">&#9632;&nbsp; Results</div>', unsafe_allow_html=True)
+        if main_file and new_files and visible_results["signature"] != _current_signature():
+            st.warning("Inputs or settings have changed since this result was produced — hit **Run** again to refresh it.")
 
-        _active_dups = len([d for d in internal_dups if d["id_dup"] not in rescued_dup_ids])
-        s1, s2, s3, s4, s5 = st.columns(5, gap="small")
-        with s1:
-            st.markdown(f'<div class="stat-box"><div class="stat-num">{len(visible_results["main_names"]):,}</div><div class="stat-label">Main DB</div></div>', unsafe_allow_html=True)
-        with s2:
-            st.markdown(f'<div class="stat-box"><div class="stat-num">{len(visible_results["new_names"]):,}</div><div class="stat-label">Checked</div></div>', unsafe_allow_html=True)
-        with s3:
-            st.markdown(f'<div class="stat-box"><div class="stat-num warn">{len(remaining_matches):,}</div><div class="stat-label">In Main DB</div></div>', unsafe_allow_html=True)
-        with s4:
-            st.markdown(f'<div class="stat-box"><div class="stat-num warn">{_active_dups:,}</div><div class="stat-label">List Dups</div></div>', unsafe_allow_html=True)
-        with s5:
-            st.markdown(f'<div class="stat-box"><div class="stat-num">{len(unique_indices):,}</div><div class="stat-label">Clean &amp; Unique</div></div>', unsafe_allow_html=True)
+        # ── The rows that got past the name comparison ──────────────────────────
+        # Cleaned the way the old Unique Rows download was, but only when screening
+        # ran: only then is the company column one the user actually picked.
+        _kept = df_new_valid.loc[visible_results["kept_ids"]].copy()
+        if was_screened and NAME_COL in _kept.columns:
+            _kept[NAME_COL] = _kept[NAME_COL].apply(clean_for_output)
+            _kept = _kept[_kept[NAME_COL].astype(str).str.strip() != ""]
+            # Push the cleaned name back into each file's own company column —
+            # that is the column this file's mapping reads from.
+            for _fname, _ccol in new_cols_by_file.items():
+                if _ccol in _kept.columns:
+                    _m = _kept[SRC_FILE_COL] == _fname
+                    _kept.loc[_m, _ccol] = _kept.loc[_m, NAME_COL]
+        _kept = _kept.sort_index()
 
-        st.markdown("")
+        if df_main_p is None:
+            st.info("Hit **Run** to build the combined list.")
+        elif not mappings:
+            st.info("Re-upload the new lists to restore the column mapping, then run again.")
+        else:
+            # ── One duplicate pass: names from the cached screening, identity keys
+            #    from the mapped rows. Recomputed every rerun, so a Keep click or a
+            #    changed mapping feeds straight through to the download.
+            if SRC_FILE_COL in _kept.columns:
+                _sources = [(str(_fname), _grp) for _fname, _grp in _kept.groupby(SRC_FILE_COL, sort=False)]
+            else:
+                _sources = [(new_files[0].name if new_files else "new list", _kept)]
 
-        if promoted:
-            st.markdown(f"<small style='color:#777'>Manually promoted from matches: {len(promoted)}</small>", unsafe_allow_html=True)
+            _main_name_col = main_col_p or detect_company_col(df_main_p.columns.tolist())
+            _built = build_combined(df_main_p, _main_name_col, mappings, key_cols, _sources, exempt)
+            _df_result = _built["df_result"]
+            _appended  = _built["appended"]
+
+            _findings = (name_findings(visible_results, exempt) if was_screened else []) + _built["findings"]
+            _by_row = {}
+            for _f in _findings:
+                _by_row.setdefault(_f["row_id"], _f)   # one verdict per row: the first check that fired
+            _findings = list(_by_row.values())
+            _active   = [f for f in _findings if not f["exempt"]]
+            _forced   = [f for f in _findings if f["exempt"]]
+            _vs_main  = len([f for f in _active if f["match_origin"] is MAIN_LIST_ORIGIN])
+            _vs_new   = len(_active) - _vs_main
+
+            # ── Summary ─────────────────────────────────────────────────────────
+            _checked = len(visible_results["new_names"])
+            # Two ways a row can carry no usable name: find_matches never bucketed it
+            # (its normalised name was empty), or clean_for_output emptied it later.
+            _no_name = ((len(visible_results["kept_ids"]) - len(_kept))
+                        + (_checked - len(visible_results["usable_ids"])))
+            _bits = [f"<strong>{len(_active):,}</strong> duplicates ({_vs_main:,} against the main list, {_vs_new:,} within the new lists)"]
+            if _no_name:
+                _bits.append(f"<strong>{_no_name:,}</strong> with no usable company name")
+            if _forced:
+                _bits.append(f"<strong>{len(_forced):,}</strong> forced in")
+            st.markdown(
+                f"<small style='color:#3a4a5e'>{_checked:,} new rows checked against "
+                f"{visible_results.get('main_row_count', 0):,} in the main list and against each other &mdash; "
+                + ", ".join(_bits)
+                + f", <strong>{len(_appended):,}</strong> appended.</small>",
+                unsafe_allow_html=True)
+            if not was_screened:
+                st.markdown("<small style='color:#3a4a5e'>Name comparison is switched off for this run — only the identity keys above were compared.</small>", unsafe_allow_html=True)
             st.markdown("")
 
-        left, right = st.columns([1.2, 1])
-
-        with left:
-            st.markdown('<div class="section-header">&#10003;&nbsp; Not matched &mdash; ready to add</div>', unsafe_allow_html=True)
-            if unique_indices:
-                cols = [c for c in (output_col_choices or [new_col]) if c in df_new_valid.columns] or [new_col]
-                df_out = df_new_valid.iloc[unique_indices][cols].copy().reset_index(drop=True)
-                df_out[new_col] = df_out[new_col].apply(clean_for_output)
-                df_out = df_out[df_out[new_col].str.strip() != ""].reset_index(drop=True)
-                st.dataframe(df_out, use_container_width=True, hide_index=True)
-
-                if promoted:
-                    st.markdown('<div class="section-header" style="margin-top:1.2rem">&#8626;&nbsp; Manually promoted from matches</div>', unsafe_allow_html=True)
-                    for item in sorted(promoted, key=lambda row: -row["score"]):
-                        p_left, p_right = st.columns([0.82, 0.18])
-                        score_class = "high" if item["score"] >= 90 else ""
-                        with p_left:
+            # ── The one review list ─────────────────────────────────────────────
+            if _findings:
+                _label = f"Duplicates left out ({len(_active)})"
+                if _forced:
+                    _label += f" — {len(_forced)} forced in"
+                with st.expander(_label, expanded=bool(st.session_state.get(DUPS_OPEN_KEY))):
+                    st.markdown("<small style='color:#3a4a5e'>Each row is listed with the check that caught it and the entry it collided with. <strong>Keep</strong> forces one into the output, whichever check flagged it.</small>", unsafe_allow_html=True)
+                    st.markdown("")
+                    for _f in sorted(_findings, key=lambda f: (f["kind"] != "key", -(f["score"] or 100), f["row_id"])):
+                        _where = ("the main list" if _f["match_origin"] is MAIN_LIST_ORIGIN
+                                  else _f["match_origin"])
+                        _chip = (f"{_f['key']} {_f['score']:.0f}%" if _f["score"] is not None
+                                 else _f["key"])
+                        _l, _r = st.columns([0.82, 0.18])
+                        with _l:
                             st.markdown(f"""
-                            <div class="match-card">
-                              <span class="match-names"><span class="match-main">{item["raw_name"]}</span><span class="match-arrow"> matched </span>{item["matched_main_name"]}</span>
-                              <span class="match-score {score_class}">{item["score"]}%</span>
+                            <div class="match-card" style="{'opacity:0.6' if _f['exempt'] else ''}">
+                              <span class="match-names"><span class="match-main">{_f['row_label']}</span><span class="match-arrow"> &rarr; </span>{_f['match_label']} <span style="color:var(--tx-lo)">in {_where}</span></span>
+                              <span class="match-score">{_chip}</span>
                             </div>""", unsafe_allow_html=True)
-                        with p_right:
-                            if st.button("Return", key=f"return_match_{item['id']}", type="secondary"):
-                                demote_match(item["id"])
-                                st.rerun()
-
+                        with _r:
+                            if _f["exempt"]:
+                                st.button("Remove", key=f"unexempt_{_f['row_id']}", type="secondary",
+                                          on_click=unexempt_row, args=(_f["row_id"],))
+                            else:
+                                st.button("Keep", key=f"exempt_{_f['row_id']}", type="secondary",
+                                          on_click=exempt_row, args=(_f["row_id"],))
                 st.markdown("")
-                _src_name = visible_results["signature"].get("main_file", "output")
+
+            # ── Result ──────────────────────────────────────────────────────────
+            st.markdown(f'<div class="section-header">&#9632;&nbsp; Result &mdash; {main_name_p}</div>', unsafe_allow_html=True)
+            _s1, _s2, _s3, _s4 = st.columns(4, gap="small")
+            _s1.markdown(f'<div class="stat-box"><div class="stat-num">{len(df_main_p):,}</div><div class="stat-label">Main rows</div></div>', unsafe_allow_html=True)
+            _s2.markdown(f'<div class="stat-box"><div class="stat-num">{len(_appended):,}</div><div class="stat-label">Appended rows</div></div>', unsafe_allow_html=True)
+            _s3.markdown(f'<div class="stat-box"><div class="stat-num warn">{len(_active):,}</div><div class="stat-label">Duplicates out</div></div>', unsafe_allow_html=True)
+            _s4.markdown(f'<div class="stat-box"><div class="stat-num">{len(_df_result):,}</div><div class="stat-label">Total rows</div></div>', unsafe_allow_html=True)
+
+            st.markdown("")
+            st.markdown(f"<small style='color:#3a4a5e'>The new rows as they are written into <strong>{main_name_p}</strong> &mdash; its columns, filled from your mapping. Anything you left on &ldquo;skip&rdquo; stays empty, and columns that exist only in the new lists are not carried over.</small>", unsafe_allow_html=True)
+            st.dataframe(_appended.head(200), use_container_width=True, hide_index=True)
+            if len(_appended) > 200:
+                st.markdown(f"<small style='color:#3a4a5e'>Showing first 200 of {len(_appended):,} new rows.</small>", unsafe_allow_html=True)
+
+            # Kept in session state so the button always has its bytes to hand,
+            # whichever rerun it ends up being clicked on.
+            st.session_state["sa_dl"] = {
+                "data": _df_result.to_csv(index=False).encode("utf-8-sig"),
+                "name": _output_filename(main_name_p, ".csv"),
+                "mime": "text/csv",
+            }
+
+            _dl = st.session_state.get("sa_dl")
+            if _dl:
+                st.markdown("")
                 st.download_button(
-                    label="&#11015;  Download CSV",
-                    data=df_out.to_csv(index=False).encode("utf-8-sig"),
-                    file_name=_output_filename(_src_name, ".csv"),
-                    mime="text/csv",
+                    label="&#11015;  Download combined list (CSV)",
+                    data=_dl["data"],
+                    file_name=_dl["name"],
+                    mime=_dl["mime"],
                     use_container_width=True,
-                    key="screener_dl_csv",
+                    key="sa_combined_dl",
                 )
-            else:
-                st.info("All companies in the new file already exist in the main list.")
-
-        with right:
-            st.markdown('<div class="section-header">&#8635;&nbsp; Already in main list</div>', unsafe_allow_html=True)
-            if remaining_matches:
-                for match in sorted(remaining_matches, key=lambda item: -item["score"]):
-                    row_left, row_right = st.columns([0.82, 0.18])
-                    score_class = "high" if match["score"] >= 90 else ""
-                    with row_left:
-                        st.markdown(f"""
-                        <div class="match-card">
-                          <span class="match-names"><span class="match-main">{match["raw_name"]}</span><span class="match-arrow"> &rarr; </span>{match["matched_main_name"]}</span>
-                          <span class="match-score {score_class}">{match["score"]}%</span>
-                        </div>""", unsafe_allow_html=True)
-                    with row_right:
-                        if st.button("Move", key=f"move_match_{match['id']}", type="secondary"):
-                            promote_match(match["id"])
-                            st.rerun()
-            else:
-                st.success("No matches found.")
-
-        if internal_dups:
-            st.markdown("")
-            st.markdown('<div class="section-header">&#9664;&#9654;&nbsp; Duplicates within the new list</div>', unsafe_allow_html=True)
-            st.markdown("<small style='color:#3a4a5e'>These pairs are fuzzy duplicates of each other. Only the first occurrence is kept — click <strong>Keep Both</strong> if they are not actually the same company.</small>", unsafe_allow_html=True)
-            st.markdown("")
-            for dup in sorted(internal_dups, key=lambda d: -d["score"]):
-                is_rescued  = dup["id_dup"] in rescued_dup_ids
-                score_class = "high" if dup["score"] >= 90 else ""
-                dup_l, dup_r = st.columns([0.82, 0.18])
-                with dup_l:
-                    st.markdown(f"""
-                    <div class="match-card" style="{'opacity:0.45' if is_rescued else ''}">
-                      <span class="match-names">
-                        <span class="match-main">{dup["name_keeper"]}</span>
-                        <span class="match-arrow"> &lArr; dup &mdash; </span>
-                        {dup["name_dup"]}
-                      </span>
-                      <span class="match-score {score_class}">{dup["score"]}%</span>
-                    </div>""", unsafe_allow_html=True)
-                with dup_r:
-                    if is_rescued:
-                        if st.button("Return", key=f"unrescue_dup_{dup['id_dup']}", type="secondary"):
-                            unrescue_dup(dup["id_dup"])
-                            st.rerun()
-                    else:
-                        if st.button("Keep Both", key=f"rescue_dup_{dup['id_dup']}", type="secondary"):
-                            rescue_dup(dup["id_dup"])
-                            st.rerun()
+                st.markdown("")
 
     else:
         st.markdown("""
         <div style='background:linear-gradient(135deg,#0d1117,#0c1520);border:1px dashed #1e2d3d;border-radius:10px;padding:2.5rem;text-align:center;margin-top:1rem'>
           <div style='font-family:JetBrains Mono,monospace;font-size:2rem;color:#1a2d3e;margin-bottom:0.8rem'>&#9632;</div>
-          <div style='color:#3a4a5e;font-size:0.9rem'>Upload both files and hit <strong style="color:#00ff8866">Run Screening</strong> to get started.</div>
-          <div style='color:#1e2d3d;font-size:0.78rem;margin-top:0.5rem'>Supports .xlsx, .xls, and .csv</div>
+          <div style='color:#3a4a5e;font-size:0.9rem'>Upload your main list and the new lists, then hit <strong style="color:#00ff8866">Run &mdash; Screen &amp; Append</strong>.</div>
+          <div style='color:#1e2d3d;font-size:0.78rem;margin-top:0.5rem'>Screening, duplicate checks and the merge all happen in one pass &nbsp;&middot;&nbsp; .xlsx, .xls, .csv</div>
         </div>
         """, unsafe_allow_html=True)
 
-# ── Tab 2: List Appender ───────────────────────────────────────────────────────
+# ── Tab 2: List Diff ─────────────────────────────────────────────────────────────
 with tab2:
-
-    st.markdown("""
-<div class="tab-desc">
-  <strong>List Appender</strong> — merge one or more files into up to two main lists.
-  Map each file's columns independently per main list, detect duplicate emails,
-  and download each combined result separately.
-</div>""", unsafe_allow_html=True)
-
-    # ── Upload ─────────────────────────────────────────────────────────────────
-    if "ap_num_main" not in st.session_state:
-        st.session_state["ap_num_main"] = 1
-
-    ap_col_main, ap_col_new = st.columns(2, gap="medium")
-
-    with ap_col_main:
-        st.markdown('<div class="upload-label">&#9632;&nbsp; 01 &mdash; Main list(s)</div>', unsafe_allow_html=True)
-        ap_main_file_1 = st.file_uploader("Main list 1", type=["xlsx", "xls", "csv"], key="ap_main_1",
-                                           label_visibility="collapsed")
-        if st.session_state["ap_num_main"] >= 2:
-            st.markdown("<div style='margin-top:0.3rem'></div>", unsafe_allow_html=True)
-            ap_main_file_2 = st.file_uploader("Main list 2", type=["xlsx", "xls", "csv"], key="ap_main_2",
-                                               label_visibility="collapsed")
-            if st.button("✕  Remove second list", key="ap_remove_main", use_container_width=True):
-                st.session_state["ap_num_main"] = 1
-                st.session_state.pop("ap_main_2", None)
-                st.rerun()
-        else:
-            ap_main_file_2 = None
-            if st.button("＋  Add second main list", key="ap_add_main", use_container_width=True):
-                st.session_state["ap_num_main"] = 2
-                st.rerun()
-
-    with ap_col_new:
-        st.markdown('<div class="upload-label">&#9632;&nbsp; 02 &mdash; Files to append</div>', unsafe_allow_html=True)
-        ap_new_files = st.file_uploader("Files to append", type=["xlsx", "xls", "csv"], key="ap_new",
-                                         accept_multiple_files=True, label_visibility="collapsed")
-
-    st.markdown("")
-
-    # ── Sheet selection (Excel only) ────────────────────────────────────────────
-    ap_main_sheet_1 = 0
-    ap_main_sheet_2 = 0
-
-    _sheet_selectors = []
-    if ap_main_file_1 and not ap_main_file_1.name.lower().endswith('.csv'):
-        _ams1 = get_excel_sheets(ap_main_file_1)
-        if _ams1:
-            _sheet_selectors.append(("Sheet — Main list 1", _ams1, "ap_main_sheet_1", 1))
-    if ap_main_file_2 and not ap_main_file_2.name.lower().endswith('.csv'):
-        _ams2 = get_excel_sheets(ap_main_file_2)
-        if _ams2:
-            _sheet_selectors.append(("Sheet — Main list 2", _ams2, "ap_main_sheet_2", 2))
-
-    if _sheet_selectors:
-        _sc = st.columns(len(_sheet_selectors), gap="small")
-        for _i, (_lbl, _sheets, _key, _which) in enumerate(_sheet_selectors):
-            with _sc[_i]:
-                _sel = st.selectbox(_lbl, _sheets, key=_key)
-                if _which == 1:
-                    ap_main_sheet_1 = _sel
-                else:
-                    ap_main_sheet_2 = _sel
-        st.markdown("")
-
-    # ── Per-file column mapping ─────────────────────────────────────────────────
-    ap_mappings_1 = {}   # {filename: {main1_col: source_col | APPEND_SKIP}}
-    ap_mappings_2 = {}   # {filename: {main2_col: source_col | APPEND_SKIP}}
-    ap_ranges     = {}   # {filename: (from_row, to_row)}
-    ap_sheets     = {}   # {filename: sheet_name}
-    ap_email_col_1 = None
-    ap_email_col_2 = None
-
-    if ap_main_file_1 and ap_new_files:
-        try:
-            ap_main_cols_1 = read_file(ap_main_file_1, nrows=0, sheet_name=ap_main_sheet_1).columns.tolist()
-            ap_main_file_1.seek(0)
-        except Exception:
-            ap_main_cols_1 = []
-
-        try:
-            ap_main_cols_2 = (
-                read_file(ap_main_file_2, nrows=0, sheet_name=ap_main_sheet_2).columns.tolist()
-                if ap_main_file_2 else []
-            )
-            if ap_main_file_2:
-                ap_main_file_2.seek(0)
-        except Exception:
-            ap_main_cols_2 = []
-
-        if ap_main_cols_1:
-            st.markdown('<div class="section-header">&#9632;&nbsp; 03 &mdash; Column mapping</div>', unsafe_allow_html=True)
-            st.markdown("<small style='color:#3a4a5e'>For every column in each main list, pick the matching column from the file to append — or skip it.</small>", unsafe_allow_html=True)
-            st.markdown("")
-
-            for ap_file in ap_new_files:
-                with st.expander(f"**{ap_file.name}**", expanded=True):
-                    _ap_sheet = 0
-                    if not ap_file.name.lower().endswith('.csv'):
-                        _ap_file_sheets = get_excel_sheets(ap_file)
-                        if _ap_file_sheets:
-                            _ap_sheet = st.selectbox(
-                                "Sheet to use",
-                                _ap_file_sheets,
-                                key=f"ap_sheet_{ap_file.name}",
-                            )
-                            st.markdown("")
-                    ap_sheets[ap_file.name] = _ap_sheet
-
-                    try:
-                        _ap_df_preview = read_file(ap_file, sheet_name=_ap_sheet)
-                        ap_file.seek(0)
-                        ap_new_cols   = _ap_df_preview.columns.tolist()
-                        _ap_row_count = len(_ap_df_preview)
-                    except Exception:
-                        st.warning(f"Could not read columns from {ap_file.name}.")
-                        continue
-
-                    MAP_OPTIONS = [APPEND_SKIP] + ap_new_cols
-
-                    # ── Mapping → Main list 1 ──────────────────────────────────
-                    file_mapping_1 = {}
-                    st.markdown(f"<small style='color:#3a4a5e;font-family:JetBrains Mono,monospace;text-transform:uppercase;letter-spacing:0.08em'>&#9654;&nbsp; Mapping to {ap_main_file_1.name}</small>", unsafe_allow_html=True)
-                    hdr_l, hdr_r = st.columns([1, 2])
-                    with hdr_l:
-                        st.markdown("<small style='color:#2a3a4e;font-family:JetBrains Mono,monospace'>Main list 1 column</small>", unsafe_allow_html=True)
-                    with hdr_r:
-                        st.markdown("<small style='color:#2a3a4e;font-family:JetBrains Mono,monospace'>Column from this file</small>", unsafe_allow_html=True)
-                    for mc in ap_main_cols_1:
-                        auto_match = next((c for c in ap_new_cols if col_key(c) == col_key(mc)), None)
-                        default_idx = ap_new_cols.index(auto_match) + 1 if auto_match else 0
-                        map_l, map_r = st.columns([1, 2])
-                        with map_l:
-                            st.markdown(f"<div style='padding:0.45rem 0;font-family:JetBrains Mono,monospace;font-size:0.8rem;color:#c9d1e0'>{mc}</div>", unsafe_allow_html=True)
-                        with map_r:
-                            file_mapping_1[mc] = st.selectbox(
-                                mc,
-                                MAP_OPTIONS,
-                                index=default_idx,
-                                key=f"ap_map_1_{ap_file.name}_{mc}",
-                                label_visibility="collapsed",
-                            )
-                    ap_mappings_1[ap_file.name] = file_mapping_1
-
-                    # ── Mapping → Main list 2 (if uploaded) ───────────────────
-                    if ap_main_cols_2:
-                        st.markdown("")
-                        file_mapping_2 = {}
-                        st.markdown(f"<small style='color:#3a4a5e;font-family:JetBrains Mono,monospace;text-transform:uppercase;letter-spacing:0.08em'>&#9654;&nbsp; Mapping to {ap_main_file_2.name}</small>", unsafe_allow_html=True)
-                        hdr_l2, hdr_r2 = st.columns([1, 2])
-                        with hdr_l2:
-                            st.markdown("<small style='color:#2a3a4e;font-family:JetBrains Mono,monospace'>Main list 2 column</small>", unsafe_allow_html=True)
-                        with hdr_r2:
-                            st.markdown("<small style='color:#2a3a4e;font-family:JetBrains Mono,monospace'>Column from this file</small>", unsafe_allow_html=True)
-                        for mc2 in ap_main_cols_2:
-                            auto_match2 = next((c for c in ap_new_cols if col_key(c) == col_key(mc2)), None)
-                            default_idx2 = ap_new_cols.index(auto_match2) + 1 if auto_match2 else 0
-                            map_l2, map_r2 = st.columns([1, 2])
-                            with map_l2:
-                                st.markdown(f"<div style='padding:0.45rem 0;font-family:JetBrains Mono,monospace;font-size:0.8rem;color:#c9d1e0'>{mc2}</div>", unsafe_allow_html=True)
-                            with map_r2:
-                                file_mapping_2[mc2] = st.selectbox(
-                                    mc2,
-                                    MAP_OPTIONS,
-                                    index=default_idx2,
-                                    key=f"ap_map_2_{ap_file.name}_{mc2}",
-                                    label_visibility="collapsed",
-                                )
-                        ap_mappings_2[ap_file.name] = file_mapping_2
-
-                    st.markdown("<div style='margin-top:0.8rem;margin-bottom:0.2rem'><small style='color:#3a4a5e;font-family:JetBrains Mono,monospace;text-transform:uppercase;letter-spacing:0.1em'>&#9632;&nbsp; Row range</small></div>", unsafe_allow_html=True)
-                    _range_l, _range_r = st.columns(2, gap="small")
-                    with _range_l:
-                        _from = st.number_input("From row", min_value=1, max_value=_ap_row_count, value=1, step=1,
-                                                key=f"ap_from_{ap_file.name}",
-                                                help="First row to include (1 = first data row)")
-                    with _range_r:
-                        _to = st.number_input("To row", min_value=1, max_value=_ap_row_count, value=_ap_row_count, step=1,
-                                              key=f"ap_to_{ap_file.name}",
-                                              help="Last row to include")
-                    ap_ranges[ap_file.name] = (int(_from), int(_to))
-
-            st.markdown("")
-            st.markdown('<div class="section-header">&#9632;&nbsp; 04 &mdash; Email duplicate check</div>', unsafe_allow_html=True)
-            EMAIL_SKIP = "— No email check —"
-            _email_cols = st.columns(2 if ap_main_cols_2 else 1, gap="small")
-
-            with _email_cols[0]:
-                if ap_main_cols_2:
-                    st.markdown("<small style='color:#3a4a5e'>Main list 1</small>", unsafe_allow_html=True)
-                email_auto_1 = next((c for c in ap_main_cols_1 if 'email' in col_key(c) or col_key(c) == 'mail'), None)
-                email_options_1 = [EMAIL_SKIP] + ap_main_cols_1
-                email_default_1 = email_options_1.index(email_auto_1) if email_auto_1 else 0
-                ap_email_col_choice_1 = st.selectbox(
-                    "Email col — Main list 1",
-                    email_options_1,
-                    index=email_default_1,
-                    key="ap_email_col_1",
-                    label_visibility="collapsed",
-                )
-                ap_email_col_1 = None if ap_email_col_choice_1 == EMAIL_SKIP else ap_email_col_choice_1
-
-            if ap_main_cols_2:
-                with _email_cols[1]:
-                    st.markdown("<small style='color:#3a4a5e'>Main list 2</small>", unsafe_allow_html=True)
-                    email_auto_2 = next((c for c in ap_main_cols_2 if 'email' in col_key(c) or col_key(c) == 'mail'), None)
-                    email_options_2 = [EMAIL_SKIP] + ap_main_cols_2
-                    email_default_2 = email_options_2.index(email_auto_2) if email_auto_2 else 0
-                    ap_email_col_choice_2 = st.selectbox(
-                        "Email col — Main list 2",
-                        email_options_2,
-                        index=email_default_2,
-                        key="ap_email_col_2",
-                        label_visibility="collapsed",
-                    )
-                    ap_email_col_2 = None if ap_email_col_choice_2 == EMAIL_SKIP else ap_email_col_choice_2
-
-            st.markdown("")
-
-    ap_run = st.button("&#9889;  Append Lists", type="primary", use_container_width=True)
-
-    if ap_run:
-        if not ap_main_file_1 or not ap_new_files:
-            st.error("Please upload at least Main list 1 and one file to append.")
-        elif not ap_mappings_1:
-            st.error("Column mapping could not be determined. Check your files.")
-        else:
-            try:
-                _runs = [(ap_main_file_1.name, ap_main_file_1, ap_main_sheet_1, ap_mappings_1, ap_email_col_1)]
-                if ap_main_file_2 and ap_mappings_2:
-                    _runs.append((ap_main_file_2.name, ap_main_file_2, ap_main_sheet_2, ap_mappings_2, ap_email_col_2))
-
-                _payloads = []
-                for _name, _mf, _ms, _maps, _ecol in _runs:
-                    with st.spinner(f"Merging into {_name}…"):
-                        _payloads.append(
-                            compute_append_payload(_name, _mf, _ms, _maps, _ecol, ap_new_files, ap_sheets, ap_ranges)
-                        )
-                st.session_state[APPEND_RESULTS_KEY] = _payloads
-                st.session_state[APPEND_RESCUED_KEY] = {}
-
-            except Exception as e:
-                st.error(f"Something went wrong: {e}")
-                st.exception(e)
-
-    _append_payloads = st.session_state.get(APPEND_RESULTS_KEY)
-
-    if _append_payloads:
-        _results = []
-        for _payload in _append_payloads:
-            _df_res = render_append_payload(_payload)
-            _results.append((_payload["main_name"], _df_res))
-            st.markdown("")
-
-        # ── Serialise download data into session state ─────────────────
-        if len(_results) == 1:
-            _sn, _df = _results[0]
-            st.session_state["ap_dl"] = {
-                "data":  _df.to_csv(index=False).encode("utf-8-sig"),
-                "name":  _output_filename(_sn, ".csv"),
-                "mime":  "text/csv",
-                "label": "&#11015;  Download CSV",
-            }
-        else:
-            _zip_buf = io.BytesIO()
-            with zipfile.ZipFile(_zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as _zf:
-                for _sn, _df in _results:
-                    _zf.writestr(
-                        _output_filename(_sn, ".csv"),
-                        _df.to_csv(index=False).encode("utf-8-sig"),
-                    )
-            st.session_state["ap_dl"] = {
-                "data":  _zip_buf.getvalue(),
-                "name":  "appended_lists.zip",
-                "mime":  "application/zip",
-                "label": "&#11015;  Download all (ZIP)",
-            }
-
-    if st.session_state.get("ap_dl"):
-        _dl = st.session_state["ap_dl"]
-        st.download_button(
-            label=_dl["label"],
-            data=_dl["data"],
-            file_name=_dl["name"],
-            mime=_dl["mime"],
-            use_container_width=True,
-            key="appender_dl",
-        )
-        st.markdown("")
-
-    elif not (ap_main_file_1 and ap_new_files):
-        st.markdown("""
-        <div style='background:linear-gradient(135deg,#0d1117,#0c1520);border:1px dashed #1e2d3d;border-radius:10px;padding:2.5rem;text-align:center;margin-top:1rem'>
-          <div style='font-family:JetBrains Mono,monospace;font-size:2rem;color:#1a2d3e;margin-bottom:0.8rem'>&#9632;</div>
-          <div style='color:#3a4a5e;font-size:0.9rem'>Upload your main list and one or more files to append, then hit <strong style="color:#00ff8866">Append Lists</strong>.</div>
-          <div style='color:#1e2d3d;font-size:0.78rem;margin-top:0.5rem'>Supports .xlsx, .xls, and .csv</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-# ── Tab 3: List Diff ─────────────────────────────────────────────────────────────
-with tab3:
 
     st.markdown("""
 <div class="tab-desc">
