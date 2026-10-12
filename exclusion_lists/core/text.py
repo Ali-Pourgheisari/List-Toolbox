@@ -19,8 +19,12 @@ SUFFIXES = re.compile(
 )
 
 
-def output_filename(source_name: str, ext: str) -> str:
-    """Name the download after the source file, minus any trailing date, plus today's."""
+def output_filename(source_name: str, ext: str, suffix: str = "") -> str:
+    """Name the download after the source file, minus any trailing date, plus today's.
+
+    `suffix` is dropped in before the date, so a variant download (the new rows on
+    their own, say) is told apart from the full one at a glance.
+    """
     stem = source_name
     for e in ('.xlsx', '.xls', '.csv'):
         if stem.lower().endswith(e):
@@ -31,6 +35,8 @@ def output_filename(source_name: str, ext: str) -> str:
     stem = re.sub(r'[\s_\-]+\d{8}$', '', stem)
     stem = re.sub(r'[^\w]', '_', stem)
     stem = re.sub(r'_+', '_', stem).strip('_') or 'output'
+    if suffix:
+        stem = f"{stem}_{re.sub(r'[^\w]+', '_', suffix).strip('_')}"
     return f"{stem}_{date.today().strftime('%Y-%m-%d')}{ext}"
 
 

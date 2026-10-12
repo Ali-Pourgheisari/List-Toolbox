@@ -54,7 +54,7 @@
   .app-logo .dot { color: var(--accent); }
 
   /* ── Tab description ── */
-  .tab-desc {
+  .page-desc {
     background: linear-gradient(135deg, var(--bg-card) 0%, var(--bg-card-b) 100%);
     border: 1px solid var(--bd);
     border-left: 3px solid var(--accent);
@@ -65,7 +65,7 @@
     color: var(--tx-dim);
     line-height: 1.6;
   }
-  .tab-desc strong { color: var(--tx); font-weight: 600; }
+  .page-desc strong { color: var(--tx); font-weight: 600; }
 
   /* ── Upload label ── */
   .upload-label {
@@ -153,7 +153,6 @@
     margin-left: 0.8rem;
     flex-shrink: 0;
   }
-  .match-score.high { color: var(--accent); background: var(--accent-bg); }
   .match-names { color: var(--tx-mid); overflow: hidden; }
   .match-main  { color: var(--tx); font-weight: 500; }
   .match-arrow { color: var(--bd-hover); margin: 0 0.4rem; }
@@ -166,36 +165,6 @@
     padding: 1.2rem 1.6rem 0.8rem;
     margin-bottom: 0.5rem;
   }
-
-  /* ── Tabs ── */
-  .stTabs [data-baseweb="tab-list"] {
-    background: transparent !important;
-    border-bottom: 1px solid var(--bd) !important;
-    gap: 3px;
-    padding-bottom: 0;
-    margin-bottom: 0;
-  }
-  .stTabs [data-baseweb="tab"] {
-    background: transparent !important;
-    color: var(--tx-lo) !important;
-    font-family: 'JetBrains Mono', monospace !important;
-    font-size: 0.72rem !important;
-    letter-spacing: 0.1em !important;
-    text-transform: uppercase !important;
-    padding: 0.5rem 1.5rem !important;
-    border-radius: 6px 6px 0 0 !important;
-    border: 1px solid transparent !important;
-    border-bottom: none !important;
-  }
-  .stTabs [aria-selected="true"] {
-    background: var(--bg-card) !important;
-    color: var(--accent) !important;
-    border-color: var(--bd) !important;
-    border-bottom-color: var(--bg-card) !important;
-  }
-  .stTabs [data-baseweb="tab-highlight"] { display: none !important; }
-  .stTabs [data-baseweb="tab-border"]    { display: none !important; }
-  .stTabs [data-baseweb="tab-panel"]     { padding-top: 1.2rem !important; }
 
   /* ── Streamlit overrides ── */
   div[data-testid="stFileUploader"] {

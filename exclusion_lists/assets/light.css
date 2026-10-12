@@ -25,6 +25,3 @@
     --sec-bg-h:   #e2e8f4;
   }
   .stApp { background: var(--bg) !important; color: var(--tx) !important; }
-  .stTabs [aria-selected="true"] {
-    border-bottom-color: var(--bg) !important;
-  }

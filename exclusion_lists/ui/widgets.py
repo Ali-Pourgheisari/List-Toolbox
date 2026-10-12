@@ -1,4 +1,4 @@
-"""Markup fragments and input blocks shared by both tabs.
+"""Markup fragments and input blocks used across the page.
 
 The stylesheet defines the classes (.section-header, .stat-box, .match-card …);
 these helpers are the only places that write them, so the markup lives in one
@@ -19,15 +19,10 @@ def caption(text: str, color: str = DIM) -> None:
     st.markdown(f"<small style='color:{color}'>{text}</small>", unsafe_allow_html=True)
 
 
-def section_header(step: str, title: str) -> None:
-    """Numbered step heading, e.g. "03 — Columns to compare"."""
+def section_header(title: str, step: str = "") -> None:
+    """Section heading, optionally numbered — e.g. "03 — Columns to compare"."""
     label = f"{step} &mdash; {title}" if step else title
     st.markdown(f'<div class="section-header">&#9632;&nbsp; {label}</div>', unsafe_allow_html=True)
-
-
-def plain_header(title: str, marker: str = "&#9632;") -> None:
-    """Section heading without a step number."""
-    st.markdown(f'<div class="section-header">{marker}&nbsp; {title}</div>', unsafe_allow_html=True)
 
 
 def upload_label(step: str, title: str) -> None:
@@ -35,8 +30,9 @@ def upload_label(step: str, title: str) -> None:
                 unsafe_allow_html=True)
 
 
-def tab_description(html: str) -> None:
-    st.markdown(f'<div class="tab-desc">{html}</div>', unsafe_allow_html=True)
+def page_description(html: str) -> None:
+    """The intro blurb at the top of the page."""
+    st.markdown(f'<div class="page-desc">{html}</div>', unsafe_allow_html=True)
 
 
 def stat_box(container, value: int, label: str, warn: bool = False) -> None:
@@ -46,19 +42,18 @@ def stat_box(container, value: int, label: str, warn: bool = False) -> None:
         unsafe_allow_html=True)
 
 
-def match_card(left: str, arrow: str, right: str, score: str,
-               score_class: str = "", dim: bool = False) -> None:
-    """One "name → matched name — score" row in a review list."""
+def match_card(left: str, arrow: str, right: str, score: str, dim: bool = False) -> None:
+    """One "name → matched name — score" row in the review list."""
     st.markdown(f"""
     <div class="match-card"{' style="opacity:0.6"' if dim else ''}>
       <span class="match-names"><span class="match-main">{left}</span>"""
                 f"""<span class="match-arrow">{arrow}</span>{right}</span>
-      <span class="match-score {score_class}">{score}</span>
+      <span class="match-score">{score}</span>
     </div>""", unsafe_allow_html=True)
 
 
 def empty_state(body: str, hint: str) -> None:
-    """The dashed placeholder panel shown before a tab has anything to display."""
+    """The dashed placeholder panel shown before there is anything to display."""
     st.markdown(f"""
     <div style='background:linear-gradient(135deg,#0d1117,#0c1520);border:1px dashed #1e2d3d;border-radius:10px;padding:2.5rem;text-align:center;margin-top:1rem'>
       <div style='font-family:JetBrains Mono,monospace;font-size:2rem;color:#1a2d3e;margin-bottom:0.8rem'>&#9632;</div>
@@ -87,13 +82,6 @@ def threshold_slider(key: str, caption_html: str) -> int:
             unsafe_allow_html=True)
     caption(caption_html.format(threshold=threshold), DIMMER)
     return threshold
-
-
-def preview_table(df, limit: int = 200) -> None:
-    """First `limit` rows of a result, with a note when there are more."""
-    st.dataframe(df.head(limit), use_container_width=True, hide_index=True)
-    if len(df) > limit:
-        caption(f"Showing first {limit} of {len(df):,} rows.")
 
 
 def render_column_mapping(title, main_columns, new_columns, key_prefix, preselect=None):

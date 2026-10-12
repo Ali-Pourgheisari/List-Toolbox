@@ -1,14 +1,14 @@
 """Application entry point.
 
 st.set_page_config must be the first Streamlit call of the run, so it happens at
-the top of main() — importing the tab modules only defines functions, it does not
+the top of main() — importing the page module only defines functions, it does not
 draw anything.
 """
 
 import streamlit as st
 
 from .theme import apply_theme, render_footer, render_header
-from .ui import list_diff, screen_append
+from .ui import screen_append
 
 
 def main() -> None:
@@ -20,11 +20,5 @@ def main() -> None:
 
     apply_theme()
     render_header()
-
-    tab_screen, tab_diff = st.tabs(["  Screen & Append  ", "  List Diff  "])
-    with tab_screen:
-        screen_append.render()
-    with tab_diff:
-        list_diff.render()
-
+    screen_append.render()
     render_footer()

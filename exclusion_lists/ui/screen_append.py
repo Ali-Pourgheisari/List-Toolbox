@@ -1,4 +1,4 @@
-"""Tab 1 — Screen & Append.
+"""Screen & Append — the app's one page.
 
 One pass: upload the main list and the new lists, fuzzy-match the new company
 names against the main list and against each other, map whatever survives onto
@@ -29,13 +29,14 @@ from . import widgets as w
 from .state import (
     DOWNLOAD_KEY,
     DUPS_OPEN_KEY,
+    NEW_ONLY_KEY,
     exempt_row,
     get_visible_results,
     store_results,
     unexempt_row,
 )
 
-TAB_DESCRIPTION = """
+PAGE_DESCRIPTION = """
   <strong>Screen &amp; Append</strong> — upload your main list and the new lists once.
   A fuzzy company-name match flags what already exists, and everything that survives
   is mapped straight onto the main list's columns. Review the name matches, in-list
@@ -146,7 +147,7 @@ def _screening_settings(main_cols, new_cols_map, new_files):
     """
     do_screening, main_col_choice, new_col_choices, threshold = True, None, {}, 70
 
-    w.section_header("03", "Columns to compare")
+    w.section_header("Columns to compare", "03")
     do_screening = st.checkbox(
         "Screen the new rows against the main list (fuzzy company-name match)",
         value=True,
@@ -182,7 +183,7 @@ def _screening_settings(main_cols, new_cols_map, new_files):
                     f"against each other — then each file's rows are mapped with its own mapping below.")
 
         st.markdown("")
-        w.section_header("04", "Match sensitivity")
+        w.section_header("Match sensitivity", "04")
         threshold = w.threshold_slider("sa_threshold", THRESHOLD_CAPTION)
 
     st.markdown("")
@@ -192,7 +193,7 @@ def _screening_settings(main_cols, new_cols_map, new_files):
 def _mapping_settings(main_file, main_cols, new_files, new_cols_map,
                       main_col_choice, new_col_choices):
     """Steps 05/06 — per-file column mapping and the identity key columns."""
-    w.section_header("05", "Column mapping")
+    w.section_header("Column mapping", "05")
     w.caption("For every column in the main list, pick the matching column from the new list — "
               "or skip it. Identically named columns are matched automatically.")
     st.markdown("")
@@ -213,7 +214,7 @@ def _mapping_settings(main_file, main_cols, new_files, new_cols_map,
             )
 
     st.markdown("")
-    w.section_header("06", "Duplicate keys")
+    w.section_header("Duplicate keys", "06")
     w.caption("Besides the company name, treat these main-list columns as identity: a new row whose "
               "value is already present is a duplicate. Email-domain columns ignore anything before "
               "the @, and websites and profile links ignore http/https, www and trailing paths.")
@@ -411,7 +412,7 @@ def _render_review_list(findings, active, forced):
 
 
 def _render_result(df_main, df_result, appended, active, main_name):
-    w.plain_header(f"Result &mdash; {main_name}")
+    w.section_header(f"Result &mdash; {main_name}")
     s1, s2, s3, s4 = st.columns(4, gap="small")
     w.stat_box(s1, len(df_main), "Main rows")
     w.stat_box(s2, len(appended), "Appended rows")
@@ -426,25 +427,37 @@ def _render_result(df_main, df_result, appended, active, main_name):
     if len(appended) > PREVIEW_LIMIT:
         w.caption(f"Showing first {PREVIEW_LIMIT} of {len(appended):,} new rows.")
 
+    st.markdown("")
+    new_only = st.checkbox(
+        "Download the new rows only — not the main list",
+        key=NEW_ONLY_KEY,
+        help="The difference: the appended rows on their own, in the main list's columns, "
+             "without the rows the main list already had.",
+    )
+
     # Kept in session state so the button always has its bytes to hand,
     # whichever rerun it ends up being clicked on.
+    out_df = appended if new_only else df_result
     st.session_state[DOWNLOAD_KEY] = {
-        "data": df_result.to_csv(index=False).encode("utf-8-sig"),
-        "name": output_filename(main_name, ".csv"),
+        "data": out_df.to_csv(index=False).encode("utf-8-sig"),
+        "name": output_filename(main_name, ".csv", suffix="new_rows" if new_only else ""),
         "mime": "text/csv",
+        "label": ("&#11015;  Download new rows only (CSV)" if new_only
+                  else "&#11015;  Download combined list (CSV)"),
     }
 
     download = st.session_state.get(DOWNLOAD_KEY)
     if download:
         st.markdown("")
         st.download_button(
-            label="&#11015;  Download combined list (CSV)",
+            label=download.get("label", "&#11015;  Download combined list (CSV)"),
             data=download["data"],
             file_name=download["name"],
             mime=download["mime"],
             use_container_width=True,
             key="sa_combined_dl",
         )
+        w.caption(f"<strong>{len(out_df):,}</strong> rows in the file.")
         st.markdown("")
 
 
@@ -495,8 +508,8 @@ def _render_results(results, mappings, key_cols, main_file, new_files, current_s
 
 
 def render() -> None:
-    """Draw the whole Screen & Append tab."""
-    w.tab_description(TAB_DESCRIPTION)
+    """Draw the whole page."""
+    w.page_description(PAGE_DESCRIPTION)
 
     main_file, new_files = _upload_inputs()
     main_sheet, new_sheets = _sheet_pickers(main_file, new_files)

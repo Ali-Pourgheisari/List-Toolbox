@@ -20,6 +20,9 @@ DUPS_OPEN_KEY = "sa_dups_open"
 
 DOWNLOAD_KEY = "sa_dl"
 
+# Download the appended rows on their own instead of the whole combined list.
+NEW_ONLY_KEY = "sa_new_rows_only"
+
 
 def store_results(payload: dict) -> None:
     """Cache a screening result, keeping exemptions only if the inputs are unchanged."""

@@ -9,8 +9,8 @@ streamlit run list_toolbox.py
 
 ## Features
 
-**Screen & Append** — upload the main list and one or more new lists, and get the
-combined file back in one pass:
+Upload the main list and one or more new lists, and get the combined file back in
+one pass:
 
 - Fuzzy company-name matching (RapidFuzz) with an adjustable threshold, ignoring
   legal suffixes, word order and abbreviations — `Acme Corp` matches `ACME Corporation Ltd`
@@ -21,21 +21,16 @@ combined file back in one pass:
   without re-running the match
 - Maps each file onto the main list's columns separately, so the new lists don't need
   matching headers
-
-**List Diff** — merge several secondary lists, dedup them, then compare against the
-main list. Entries found on both sides are dropped from *both*, leaving only what is
-unique to one. Downloads as CSV or Excel.
-
-**Throughout** — `.xlsx` / `.xls` / `.csv` with sheet selection, automatic CSV
-delimiter and encoding detection, country-name normalisation (`Deutschland`, `DE`,
-`Germany` → one value), and a light/dark theme.
+- `.xlsx` / `.xls` / `.csv` with sheet selection, automatic CSV delimiter and encoding
+  detection, country-name normalisation (`Deutschland`, `DE`, `Germany` → one value),
+  and a light/dark theme
 
 ## Layout
 
 ```
 list_toolbox.py          entry point
 exclusion_lists/
-  app.py                 page config, theme, tabs
+  app.py                 page config, theme, page
   theme.py + assets/     CSS
   core/                  pure logic, no Streamlit — importable and testable
     text.py              name normalisation
@@ -47,6 +42,5 @@ exclusion_lists/
   ui/                    Streamlit layer
     state.py             session state
     widgets.py           shared markup
-    screen_append.py     tab 1
-    list_diff.py         tab 2
+    screen_append.py     the page
 ```

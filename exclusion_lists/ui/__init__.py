@@ -1,1 +1,1 @@
-"""Streamlit layer: session state, shared widgets, and one module per tab."""
+"""Streamlit layer: session state, shared widgets, and the page itself."""
