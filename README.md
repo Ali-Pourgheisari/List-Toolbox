@@ -1,6 +1,6 @@
 # List Toolbox
 
-A Streamlit app for screening new company lists against a main list and merging them.
+A Streamlit app for screening a new CSV/Excel file against another and merging them.
 
 ```bash
 pip install -r requirements.txt
