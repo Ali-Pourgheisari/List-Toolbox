@@ -412,12 +412,24 @@ def _render_review_list(findings, active, forced):
 
 
 def _render_result(df_main, df_result, appended, active, main_name):
+    # Read before the checkbox is drawn, so the stats below describe the file the
+    # checkbox is currently asking for. Clicking it reruns the script, and the
+    # widget further down picks this same value back up off its key.
+    new_only = bool(st.session_state.get(NEW_ONLY_KEY, False))
+    out_df   = appended if new_only else df_result
+
     w.section_header(f"Result &mdash; {main_name}")
     s1, s2, s3, s4 = st.columns(4, gap="small")
-    w.stat_box(s1, len(df_main), "Main rows")
-    w.stat_box(s2, len(appended), "Appended rows")
-    w.stat_box(s3, len(active), "Duplicates out", warn=True)
-    w.stat_box(s4, len(df_result), "Total rows")
+    if new_only:
+        w.stat_box(s1, len(df_main), "Main rows out")
+        w.stat_box(s2, len(appended), "New rows")
+        w.stat_box(s3, len(active), "Duplicates out", warn=True)
+        w.stat_box(s4, len(out_df), "Rows in file")
+    else:
+        w.stat_box(s1, len(df_main), "Main rows")
+        w.stat_box(s2, len(appended), "Appended rows")
+        w.stat_box(s3, len(active), "Duplicates out", warn=True)
+        w.stat_box(s4, len(out_df), "Total rows")
 
     st.markdown("")
     w.caption(f"The new rows as they are written into <strong>{main_name}</strong> &mdash; its columns, "
@@ -428,7 +440,7 @@ def _render_result(df_main, df_result, appended, active, main_name):
         w.caption(f"Showing first {PREVIEW_LIMIT} of {len(appended):,} new rows.")
 
     st.markdown("")
-    new_only = st.checkbox(
+    st.checkbox(
         "Download the new rows only — not the main list",
         key=NEW_ONLY_KEY,
         help="The difference: the appended rows on their own, in the main list's columns, "
@@ -437,7 +449,6 @@ def _render_result(df_main, df_result, appended, active, main_name):
 
     # Kept in session state so the button always has its bytes to hand,
     # whichever rerun it ends up being clicked on.
-    out_df = appended if new_only else df_result
     st.session_state[DOWNLOAD_KEY] = {
         "data": out_df.to_csv(index=False).encode("utf-8-sig"),
         "name": output_filename(main_name, ".csv", suffix="new_rows" if new_only else ""),
@@ -457,7 +468,9 @@ def _render_result(df_main, df_result, appended, active, main_name):
             use_container_width=True,
             key="sa_combined_dl",
         )
-        w.caption(f"<strong>{len(out_df):,}</strong> rows in the file.")
+        w.caption(f"<strong>{len(out_df):,}</strong> rows in the file"
+                  + (f" &mdash; the {len(df_main):,} main-list rows are not included."
+                     if new_only else "."))
         st.markdown("")
 
 
