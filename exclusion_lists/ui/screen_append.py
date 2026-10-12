@@ -145,7 +145,7 @@ def _screening_settings(main_cols, new_cols_map, new_files):
 
     Returns (do_screening, main_col_choice, {filename: company column}, threshold).
     """
-    do_screening, main_col_choice, new_col_choices, threshold = True, None, {}, 70
+    do_screening, main_col_choice, new_col_choices, threshold = True, None, {}, w.DEFAULT_THRESHOLD
 
     w.section_header("Columns to compare", "03")
     do_screening = st.checkbox(
@@ -529,7 +529,7 @@ def render() -> None:
     main_cols, new_cols_map, new_cols_union = _read_headers(
         main_file, new_files, main_sheet, new_sheets)
 
-    do_screening, main_col_choice, new_col_choices, threshold = True, None, {}, 70
+    do_screening, main_col_choice, new_col_choices, threshold = True, None, {}, w.DEFAULT_THRESHOLD
     if main_cols and new_cols_union:
         do_screening, main_col_choice, new_col_choices, threshold = _screening_settings(
             main_cols, new_cols_map, new_files)

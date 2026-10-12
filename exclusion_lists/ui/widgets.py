@@ -13,6 +13,10 @@ from ..core.text import col_key
 DIM = "#3a4a5e"     # secondary caption colour
 DIMMER = "#2a3a4e"  # tertiary caption colour
 
+# Where the match-sensitivity slider starts. Also the fallback the page uses when
+# screening is switched off and the slider is never drawn, so it lives here once.
+DEFAULT_THRESHOLD = 85
+
 
 def caption(text: str, color: str = DIM) -> None:
     """Small muted explanatory line."""
@@ -69,8 +73,8 @@ def threshold_slider(key: str, caption_html: str) -> int:
     with slider_col:
         threshold = st.slider(
             "Match threshold",
-            min_value=50, max_value=100, value=70,
-            help="Lower = catches more variations. 70 is a good default.",
+            min_value=50, max_value=100, value=DEFAULT_THRESHOLD,
+            help=f"Lower = catches more variations. {DEFAULT_THRESHOLD} is a good default.",
             label_visibility="collapsed",
             key=key,
         )
